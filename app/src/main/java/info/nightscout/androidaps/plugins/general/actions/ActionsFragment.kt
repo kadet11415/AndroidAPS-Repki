@@ -109,6 +109,7 @@ class ActionsFragment : DaggerFragment() {
     private var sensorLevelLabel: TextView? = null
     private var insulinLevelLabel: TextView? = null
     private var pbLevelLabel: TextView? = null
+    private var cannulaOrPatch: TextView? = null
 
     private var medlinkBatteryLevel: TextView? = null
     private var medlinkBatteryLabel: TextView? = null
@@ -158,6 +159,7 @@ class ActionsFragment : DaggerFragment() {
         sensorLevelLabel = view.findViewById(R.id.sensor_level_label)
         insulinLevelLabel = view.findViewById(R.id.insulin_level_label)
         pbLevelLabel = view.findViewById(R.id.pb_level_label)
+        cannulaOrPatch = view.findViewById(R.id.cannula_or_patch)
 
         profileSwitch?.setOnClickListener {
             ProfileSwitchDialog().show(childFragmentManager, "ProfileSwitchDialog")
@@ -323,6 +325,10 @@ class ActionsFragment : DaggerFragment() {
         }
         tempTarget?.visibility = (profile != null && !loop.isDisconnected).toVisibility()
         tddStats?.visibility = pump.pumpDescription.supportsTDDs.toVisibility()
+
+        cannulaOrPatch?.text = if (pump.pumpDescription.isPatchPump) rh.gs(R.string.patch_pump) else rh.gs(R.string.cannula)
+        val imageResource = if (pump.pumpDescription.isPatchPump) R.drawable.ic_patch_pump_outline else R.drawable.ic_cp_age_cannula
+        cannulaOrPatch?.setCompoundDrawablesWithIntrinsicBounds(imageResource, 0, 0, 0)
 
         if (!config.NSCLIENT) {
             if(pump is MedLinkMedtronicPumpPlugin) {
