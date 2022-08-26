@@ -30,7 +30,7 @@ import info.nightscout.androidaps.plugins.pump.common.MedLinkPumpPluginAbstract
 import info.nightscout.androidaps.plugins.pump.common.data.MedLinkPumpStatus
 import info.nightscout.androidaps.plugins.pump.common.defs.PumpDeviceState
 import info.nightscout.androidaps.plugins.pump.common.defs.PumpDriverState
-import info.nightscout.androidaps.plugins.pump.common.defs.PumpStatusType
+import info.nightscout.androidaps.plugins.pump.common.defs.PumpRunningState
 import info.nightscout.androidaps.plugins.pump.common.defs.PumpTempBasalType
 import info.nightscout.androidaps.plugins.pump.common.defs.PumpType
 import info.nightscout.androidaps.plugins.pump.common.events.EventRefreshButtonState
@@ -39,6 +39,7 @@ import info.nightscout.androidaps.plugins.pump.common.hw.medlink.activities.Bolu
 import info.nightscout.androidaps.plugins.pump.common.hw.medlink.activities.BolusDeliverCallback
 import info.nightscout.androidaps.plugins.pump.common.hw.medlink.activities.BolusProgressCallback
 import info.nightscout.androidaps.plugins.pump.common.hw.medlink.activities.MedLinkStandardReturn
+import info.nightscout.androidaps.plugins.pump.common.hw.medlink.ble.CommandPriority
 import info.nightscout.androidaps.plugins.pump.common.hw.medlink.ble.command.*
 import info.nightscout.androidaps.plugins.pump.common.hw.medlink.ble.data.*
 import info.nightscout.androidaps.plugins.pump.common.hw.medlink.defs.MedLinkCommandType
@@ -58,8 +59,6 @@ import info.nightscout.androidaps.plugins.pump.medtronic.R.string
 import info.nightscout.androidaps.plugins.pump.medtronic.comm.PumpResponses
 import info.nightscout.androidaps.plugins.pump.medtronic.comm.activities.*
 import info.nightscout.androidaps.plugins.pump.medtronic.comm.history.pump.PumpHistoryEntry
-import info.nightscout.androidaps.plugins.pump.medtronic.comm.history.pump.PumpHistoryEntryType
-import info.nightscout.androidaps.plugins.pump.medtronic.comm.history.pump.PumpHistoryResult
 import info.nightscout.androidaps.plugins.pump.medtronic.data.EnliteInterval
 import info.nightscout.androidaps.plugins.pump.medtronic.data.MedLinkMedtronicHistoryData
 import info.nightscout.androidaps.plugins.pump.medtronic.data.NextStartStop
@@ -79,7 +78,6 @@ import info.nightscout.androidaps.utils.DateUtil
 import info.nightscout.androidaps.utils.FabricPrivacy
 import info.nightscout.androidaps.utils.T
 import info.nightscout.androidaps.utils.TimeChangeType
-import info.nightscout.androidaps.utils.resources.ResourceHelper
 import info.nightscout.androidaps.utils.rx.AapsSchedulers
 import info.nightscout.shared.logging.AAPSLogger
 import info.nightscout.shared.logging.LTag
@@ -105,7 +103,7 @@ import java.util.function.Function
 import java.util.function.Supplier
 import java.util.stream.Collectors
 import java.util.stream.Stream
-import java.util.stream.Stream.*
+import java.util.stream.Stream.of
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.math.roundToInt
@@ -115,7 +113,7 @@ import kotlin.math.roundToInt
  */
 @Singleton
 open class MedLinkMedtronicPumpPlugin @Inject constructor(
-    injector: HasAndroidInjector?,
+    injector: HasAndroidInjector,
     aapsLogger: AAPSLogger,
     rxBus: RxBus?,
     context: Context?,
@@ -134,7 +132,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     aapsSchedulers: AapsSchedulers?,
     pumpSync: PumpSync?,
     pumpSyncStorage: PumpSyncStorage?,
-    private val bgSync: BgSync
+    private val bgSync: BgSync,
 ) : MedLinkPumpPluginAbstract(
     PluginDescription(
 
@@ -152,6 +150,8 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     aapsSchedulers!!, pumpSync!!, pumpSyncStorage!!
 ), Pump, MicrobolusPumpInterface, MedLinkPumpDevice, MedtronicPumpPluginInterface {
 
+    private lateinit var remainingBolus: DetailedBolusInfo
+    private var bolusHistoryCheck: Boolean = false
     private var hasFirstAlert: Boolean = false
     private var hasSecondAlert: Boolean = false
     var lastCalibration: ZonedDateTime? = null
@@ -159,10 +159,10 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
 
     // private override var dateUtil: DateUtil? = null
     override val reservoirLevel: Double
-        get() = medLinkPumpStatus.reservoirLevel
+        get() = medLinkPumpStatus.reservoirRemainingUnits
 
     override val batteryLevel: Int
-        get() = medLinkPumpStatus.batteryLevel
+        get() = medLinkPumpStatus.batteryRemaining
 
     override val lastConnectionTimeMillis: Long
         get() = medLinkPumpStatus.lastConnection
@@ -182,7 +182,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     private val lastPumpHistoryEntry: PumpHistoryEntry? = null
     private val busyTimestamps: MutableList<Long> = ArrayList()
     private var hasTimeDateOrTimeZoneChanged = false
-    var tempBasalMicrobolusOperations: TempBasalMicrobolusOperations?
+    var tempBasalMicrobolusOperations: TempBasalMicrobolusOperations = TempBasalMicrobolusOperations()
         private set
     private var percent: Int? = null
     private var durationInMinutes: Int? = null
@@ -190,12 +190,11 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     private var result: PumpEnactResult? = null
     private var bolusDeliveryType = MedtronicPumpPluginInterface.BolusDeliveryType.Idle
     private var customActions: List<CustomAction>? = null
-    private var lastStatus = PumpStatusType.Running.status
+    private var lastStatus = PumpRunningState.Running.status
     protected var lastBGHistoryRead = 0L
     var basalProfile: BasalProfile? = null
     private var lastPreviousHistory = 0L
     private var lastTryToConnect = 0L
-    private var lastBolusTime: Long = 0
     private var lastBgs: Array<Int?>? = null
     private var bgIndex = 0
     private var lastBolusHistoryRead = 0L
@@ -204,7 +203,6 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     private var pumpTimeDelta = 0L
     private var lastDetailedBolusInfo: DetailedBolusInfo? = null
     private var late1Min = false
-    private var checkBolusAtNextStatus = false
     private var lastProfileRead: Long = 0
     override fun applyBasalConstraints(absoluteRate: Constraint<Double>, profile: Profile): Constraint<Double> {
         return absoluteRate // TODO("Evaluate")
@@ -232,7 +230,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
             context.startActivity(i)
             return
         }
-        if (PumpStatusType.Suspended != medLinkPumpStatus.pumpStatusType) {
+        if (PumpRunningState.Suspended != medLinkPumpStatus.pumpRunningState) {
             val function = ChangeStatusCallback(
                 aapsLogger,
                 ChangeStatusCallback.OperationType.STOP, this
@@ -252,7 +250,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                     }
                 }
                 sendPumpUpdateEvent()
-                callback.result(result).run()
+                callback.result(result!!).run()
                 f
             }
             val message = MedLinkPumpMessage<PumpDriverState, Any>(
@@ -263,7 +261,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                     aapsLogger,
                     medLinkService!!.medLinkServiceData,
                     this
-                )
+                ), CommandPriority.NORMAL
             )
             medLinkService!!.medtronicUIComm?.executeCommandCP(message)
         }
@@ -277,11 +275,11 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
 
     override fun storeCancelTempBasal() {
         aapsLogger.info(LTag.DATABASE, "stopping basal")
-        val timestemp = if (pumpStatusData.runningTBR != null) pumpStatusData.runningTBR.date
-        else dateUtil.now()
+        val state = pumpSync.expectedPumpState()
+        val timestamp = state?.temporaryBasal?.timestamp ?: dateUtil.now()
         pumpSync.syncStopTemporaryBasalWithPumpId(
-            timestamp = timestemp,
-            endPumpId = timestemp,
+            timestamp = timestamp,
+            endPumpId = dateUtil.now(),
             pumpType = pumpType ?: PumpType.GENERIC_AAPS,
             pumpSerial = serialNumber()
         )
@@ -293,12 +291,12 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
 
     fun startPump(callback: Callback?) {
         aapsLogger.info(LTag.PUMP, "MedtronicPumpPlugin::startPump - ")
-        if (medLinkPumpStatus.pumpStatusType !== PumpStatusType.Running) {
+        if (medLinkPumpStatus.pumpRunningState !== PumpRunningState.Running) {
             buildStartStopCommands()
             val activity: Function<Supplier<Stream<String>>, MedLinkStandardReturn<PumpDriverState>> =
-            //     if(tempBasalMicrobolusOperations != null && tempBasalMicrobolusOperations!!.operations.isNotEmpty() && callback != null){
+            //     if(tempBasalMicrobolusOperations != null && tempBasalMicrobolusOperations.operations.isNotEmpty() && callback != null){
             //     buildChangeStatusFunction(
-            //     tempBasalMicrobolusOperations!!.operations.first,
+            //     tempBasalMicrobolusOperations.operations.first,
             //     callback, this
                 // ).first()} else {
                 ChangeStatusCallback(aapsLogger, ChangeStatusCallback.OperationType.START, this)
@@ -318,7 +316,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                             }
                         }
                         sendPumpUpdateEvent()
-                        callback?.result(result)?.run()
+                        callback?.result(result!!)?.run()
                         f
                     }
 
@@ -330,7 +328,8 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                 BleStartCommand(
                     aapsLogger, medLinkService!!.medLinkServiceData,
                     this
-                )
+                ),
+                CommandPriority.NORMAL
             )
             medLinkService!!.medtronicUIComm?.executeCommandCP(message)
         }
@@ -346,7 +345,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     }
 
     override fun isFakingTempsByMicroBolus(): Boolean {
-        return tempBasalMicrobolusOperations != null && tempBasalMicrobolusOperations!!.remainingOperations > 0
+        return tempBasalMicrobolusOperations.remainingOperations > 0
     }
 
     override val isFakingTempsByExtendedBoluses: Boolean
@@ -391,21 +390,21 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         //        if(initC instanceof HashSet) {
 
         //        }else{
-//            this.initCommands= new HashSet<>();
-//        }
+        //            this.initCommands= new HashSet<>();
+        //        }
 
-//        String encoding = sp.getString(MedtronicConst.Prefs.Encoding, "RileyLink 4b6b Encoding");
-//
-//        if ("RileyLink 4b6b Encoding".equals(encoding)) {
-//            sp.putString(MedtronicConst.Prefs.Encoding, getRh().gs(R.string.key_medtronic_pump_encoding_4b6b_rileylink));
-//        }
-//
-//        if ("Local 4b6b Encoding".equals(encoding)) {
-//            sp.putString(MedtronicConst.Prefs.Encoding, getRh().gs(R.string.key_medtronic_pump_encoding_4b6b_local));
-//        }
+        //        String encoding = sp.getString(MedtronicConst.Prefs.Encoding, "RileyLink 4b6b Encoding");
+        //
+        //        if ("RileyLink 4b6b Encoding".equals(encoding)) {
+        //            sp.putString(MedtronicConst.Prefs.Encoding, getRh().gs(R.string.key_medtronic_pump_encoding_4b6b_rileylink));
+        //        }
+        //
+        //        if ("Local 4b6b Encoding".equals(encoding)) {
+        //            sp.putString(MedtronicConst.Prefs.Encoding, getRh().gs(R.string.key_medtronic_pump_encoding_4b6b_local));
+        //        }
     }
 
-    override fun onStartCustomActions() {
+    override fun onStartScheduledPumpActions() {
         // check status every minute (if any status needs refresh we send readStatus command)
         Thread {
             do {
@@ -420,7 +419,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                         }
                     }
                     if (System.currentTimeMillis() - pumpStatusData.lastConnection > 590000) {
-                        readPumpHistory(false)
+                        readPumpData(false)
                     }
                     clearBusyQueue()
                 }
@@ -462,7 +461,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
 
     //TODO implement
     override fun isSuspended(): Boolean {
-        return pumpStatusData.pumpStatusType === PumpStatusType.Suspended
+        return pumpStatusData.pumpRunningState === PumpRunningState.Suspended
     }
 
     override fun isBusy(): Boolean {
@@ -494,7 +493,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
 
     override fun finishHandshaking() {}
     override fun connect(reason: String) {
-//        medLinkService.getMedLinkRFSpy().e()
+        //        medLinkService.getMedLinkRFSpy().e()
     }
 
     //
@@ -508,24 +507,24 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
 
     private fun doWeHaveAnyStatusNeededRefreshing(statusRefresh: Map<MedLinkMedtronicStatusRefreshType?, Long?>?): Boolean {
         for ((key, value) in statusRefresh!!) {
-//            aapsLogger.info(
-//                    LTag.PUMP, "Next Command " + round(
-//                    (value!! - System.currentTimeMillis()).toFloat()
-//            )
-//            )
-//            aapsLogger.info(LTag.PUMP, key!!.name)
+            //            aapsLogger.info(
+            //                    LTag.PUMP, "Next Command " + round(
+            //                    (value!! - System.currentTimeMillis()).toFloat()
+            //            )
+            //            )
+            //            aapsLogger.info(LTag.PUMP, key!!.name)
             if (value!! -
                 System.currentTimeMillis() <= 0
             ) {
                 return true
             }
         }
-        for (oper in tempBasalMicrobolusOperations!!.operations) {
-//            aapsLogger.info(
-//                    LTag.PUMP, "Next Command " +
-//                    oper.releaseTime.toDateTime()
-//            )
-//            aapsLogger.info(LTag.PUMP, oper.toString())
+        for (oper in tempBasalMicrobolusOperations.operations) {
+            //            aapsLogger.info(
+            //                    LTag.PUMP, "Next Command " +
+            //                    oper.releaseTime.toDateTime()
+            //            )
+            //            aapsLogger.info(LTag.PUMP, oper.toString())
             if (oper.releaseTime.isAfter(LocalDateTime.now().minus(Seconds.seconds(30)))) {
                 return true
             }
@@ -596,31 +595,32 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                 medLinkPumpStatus
             ),
             btSleepTime,
-            BlePartialCommand(aapsLogger, medLinkService!!.medLinkServiceData)
+            BlePartialCommand(aapsLogger, medLinkService!!.medLinkServiceData),
+            CommandPriority.NORMAL
         )
         medLinkService!!.medtronicUIComm?.executeCommandCP(msg)
         if (debugHistory) aapsLogger.debug(LTag.PUMP, "HST: After task")
 
-//        PumpHistoryResult historyResult = (PumpHistoryResult) responseTask2.returnData;
+        //        PumpHistoryResult historyResult = (PumpHistoryResult) responseTask2.returnData;
 
-//        if (debugHistory)
-//            getAapsLogger().debug(LTag.PUMP, "HST: History Result: " + historyResult.toString());
+        //        if (debugHistory)
+        //            getAapsLogger().debug(LTag.PUMP, "HST: History Result: " + historyResult.toString());
 
-//        PumpHistoryEntry latestEntry = historyResult.getLatestEntry();
+        //        PumpHistoryEntry latestEntry = historyResult.getLatestEntry();
 
-//        if (debugHistory)
-//            getAapsLogger().debug(LTag.PUMP, getLogPrefix() + "Last entry: " + latestEntry);
+        //        if (debugHistory)
+        //            getAapsLogger().debug(LTag.PUMP, getLogPrefix() + "Last entry: " + latestEntry);
 
-//        if (latestEntry == null) // no new history to read
-//            return;
+        //        if (latestEntry == null) // no new history to read
+        //            return;
 
-//        this.lastPumpHistoryEntry = latestEntry;
-//        sp.putLong(MedtronicConst.Statistics.LastPumpHistoryEntry, latestEntry.atechDateTime);
+        //        this.lastPumpHistoryEntry = latestEntry;
+        //        sp.putLong(MedtronicConst.Statistics.LastPumpHistoryEntry, latestEntry.atechDateTime);
 
-//        if (debugHistory)
-//            getAapsLogger().debug(LTag.PUMP, "HST: History: valid=" + historyResult.validEntries.size() + ", unprocessed=" + historyResult.unprocessedEntries.size());
-//
-//        this.medtronicHistoryData.addNewHistory(historyResult);
+        //        if (debugHistory)
+        //            getAapsLogger().debug(LTag.PUMP, "HST: History: valid=" + historyResult.validEntries.size() + ", unprocessed=" + historyResult.unprocessedEntries.size());
+        //
+        //        this.medtronicHistoryData.addNewHistory(historyResult);
         medtronicHistoryData.filterNewEntries()
 
         // determine if first run, if yes detrmine how much of update do we need
@@ -662,24 +662,23 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                 BlePartialCommand(aapsLogger, medLinkService!!.medLinkServiceData)
             )
             medLinkService!!.medtronicUIComm?.executeCommandCP(msg)
-
         }
     }
 
-    private fun readPumpHistory(scheduled: Boolean, interval: Long = 300000L) {
-//        if (isLoggingEnabled())
-//            LOG.error(getLogPrefix() + "readPumpHistory WIP.");
+    private fun readPumpData(scheduled: Boolean, interval: Long = 300000L) {
+        //        if (isLoggingEnabled())
+        //            LOG.error(getLogPrefix() + "readPumpHistory WIP.");
         scheduleNextReadState(scheduled, interval)
         aapsLogger.info(LTag.CONFIGBUILDER, "read pump history")
         readPumpHistoryLogic()
 
-//        if (bgDelta == 1 || bgDelta > 5) {
-//            scheduleNextRefresh(MedLinkMedtronicStatusRefreshType.PumpHistory);
-//        } else if (bgDelta == 0) {
-//            scheduleNextRefresh(MedLinkMedtronicStatusRefreshType.PumpHistory, 1);
-//        } else {
-//            scheduleNextRefresh(MedLinkMedtronicStatusRefreshType.PumpHistory, -1 * bgDelta);
-//        }
+        //        if (bgDelta == 1 || bgDelta > 5) {
+        //            scheduleNextRefresh(MedLinkMedtronicStatusRefreshType.PumpHistory);
+        //        } else if (bgDelta == 0) {
+        //            scheduleNextRefresh(MedLinkMedtronicStatusRefreshType.PumpHistory, 1);
+        //        } else {
+        //            scheduleNextRefresh(MedLinkMedtronicStatusRefreshType.PumpHistory, -1 * bgDelta);
+        //        }
         if (medtronicHistoryData.hasRelevantConfigurationChanged()) {
             scheduleNextRefresh(MedLinkMedtronicStatusRefreshType.Configuration, -1)
         }
@@ -726,9 +725,9 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
             pumpTimeDelta = pumpStatusData.lastConnection -
                 pumpStatusData.lastDataTime
             var minutesDelta = Math.toIntExact(TimeUnit.MILLISECONDS.toMinutes(pumpTimeDelta))
-//            if (calculateBGDeltaAvg(bgDelta) > 6.0) {
-//                minutesDelta++
-//            }
+            //            if (calculateBGDeltaAvg(bgDelta) > 6.0) {
+            //                minutesDelta++
+            //            }
             if (aapsLogger != null) {
                 aapsLogger.info(LTag.CONFIGBUILDER, "Last Connection" + pumpStatusData.lastConnection)
                 aapsLogger.info(LTag.CONFIGBUILDER, "Next Delta $minutesDelta")
@@ -741,9 +740,9 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                 aapsLogger.info(LTag.CONFIGBUILDER, "Last bg " + EnliteInterval.toString())
 
             }
-//            while (bgDelta >= 5) {
-//                bgDelta -= 5
-//            }
+            //            while (bgDelta >= 5) {
+            //                bgDelta -= 5
+            //            }
             var lostContactDelta = 0
             if (pumpStatusData.lastConnection - pumpStatusData.getLastBGTimestamp() > 360000 || late1Min) {
                 lostContactDelta = 2
@@ -761,11 +760,11 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
             }
         } else {
             aapsLogger.info(LTag.CONFIGBUILDER, "scheduling")
-                scheduleNextRefresh(
-                    MedLinkMedtronicStatusRefreshType.PumpHistory,
+            scheduleNextRefresh(
+                MedLinkMedtronicStatusRefreshType.PumpHistory,
                 300000
-                )
-            }
+            )
+        }
         return 0
     }
 
@@ -809,80 +808,92 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
 
         // execute
         val refreshTypesNeededToReschedule: MutableSet<MedLinkMedtronicStatusRefreshType?> = HashSet()
-        if (!tempBasalMicrobolusOperations!!.operations.isEmpty() &&
-            tempBasalMicrobolusOperations!!.operations.first.releaseTime.isBefore(LocalDateTime.now().plus(Seconds.seconds(30))) &&
-            !tempBasalMicrobolusOperations!!.operations.first.isCommandIssued
+        if (!tempBasalMicrobolusOperations.operations.isEmpty() &&
+            tempBasalMicrobolusOperations.operations.first.releaseTime.isBefore(LocalDateTime.now().plus(Seconds.seconds(30))) &&
+            !tempBasalMicrobolusOperations.operations.first.isCommandIssued
         ) {
-            val oper = tempBasalMicrobolusOperations!!.operations.peek()
+            val oper = tempBasalMicrobolusOperations.operations.peek()
             aapsLogger.info(
                 LTag.PUMP, "Next Command " +
                     oper.releaseTime.toDateTime()
             )
             aapsLogger.info(LTag.PUMP, oper.toString())
-            oper.isCommandIssued = true
-            when (oper.operationType) {
-                TempBasalMicroBolusPair.OperationType.SUSPEND    -> {
-                    tempBasalMicrobolusOperations!!.setShouldBeSuspended(true)
-                    if (PumpStatusType.Suspended != pumpStatusData.pumpStatusType) {
-                        stopPump(object : Callback() {
-                            override fun run() {
-                                if (medLinkPumpStatus.pumpStatusType ===
-                                    PumpStatusType.Suspended
-                                ) {
-                                    tempBasalMicrobolusOperations!!.operations.poll()
-                                    oper.isCommandIssued = true
+            if (!oper?.isCommandIssued!!) {
+
+                oper.isCommandIssued = true
+                when (oper.operationType!!) {
+                    TempBasalMicroBolusPair.OperationType.SUSPEND    -> {
+                        tempBasalMicrobolusOperations.setShouldBeSuspended(true)
+                        if (PumpRunningState.Suspended != pumpStatusData.pumpRunningState) {
+                            stopPump(object : Callback() {
+                                override fun run() {
+                                    if (medLinkPumpStatus.pumpRunningState ===
+                                        PumpRunningState.Suspended
+                                    ) {
+                                        tempBasalMicrobolusOperations.operations.poll()
+                                        oper.isCommandIssued = true
+                                    }
                                 }
-                            }
-                        })
-                    } else {
-                        tempBasalMicrobolusOperations!!.operations.poll()
-                    }
-                }
-
-                TempBasalMicroBolusPair.OperationType.REACTIVATE -> {
-                    tempBasalMicrobolusOperations!!.setShouldBeSuspended(false)
-                    val callback = oper.callback
-                    reactivatePump(oper) { f: Any? -> callback }
-                }
-
-                TempBasalMicroBolusPair.OperationType.BOLUS      -> {
-                    if (PumpStatusType.Suspended == pumpStatusData.pumpStatusType) {
-                        reactivatePump(oper) { o: Any? -> o }
-                    }
-                    val detailedBolusInfo = DetailedBolusInfo()
-                    detailedBolusInfo.lastKnownBolusTime = pumpStatusData.lastBolusTime!!.time
-                    detailedBolusInfo.eventType = DetailedBolusInfo.EventType.CORRECTION_BOLUS
-                    detailedBolusInfo.insulin = oper.dose
-                    detailedBolusInfo.bolusType = DetailedBolusInfo.BolusType.TBR
-                    detailedBolusInfo.bolusTimestamp = System.currentTimeMillis()
-                    aapsLogger.debug(LTag.APS, "applyAPSRequest: bolus()")
-                    val callback = { o: PumpEnactResult? ->
-                        aapsLogger.info(LTag.PUMPBTCOMM, "temp basal bolus $o")
-                        if (o?.success == true) {
-                            tempBasalMicrobolusOperations!!.operations.poll()
+                            })
                         } else {
-                            oper.isCommandIssued = false
+                            tempBasalMicrobolusOperations.operations.poll()
                         }
-                        Unit
                     }
-                    deliverTreatment(detailedBolusInfo, callback)
+
+                    TempBasalMicroBolusPair.OperationType.REACTIVATE -> {
+                        tempBasalMicrobolusOperations.setShouldBeSuspended(false)
+                        val callback = oper.callback
+                        reactivatePump(oper) { callback }
+                    }
+
+                    TempBasalMicroBolusPair.OperationType.BOLUS      -> {
+                        if (PumpRunningState.Suspended == pumpStatusData.pumpRunningState) {
+                            reactivatePump(oper) { o: Any? -> o }
+                        }
+                        val detailedBolusInfo = DetailedBolusInfo()
+                        detailedBolusInfo.lastKnownBolusTime =
+                            if (pumpStatusData.lastBolusTime != null) pumpStatusData.lastBolusTime!!.time else if (pumpSyncStorage.pumpSyncStorageBolus.isNotEmpty()) {
+                                val bolusList = pumpSyncStorage.pumpSyncStorageBolus
+                                bolusList.sortBy { it.date }
+                                bolusList[0].date
+                            } else {
+                                System.currentTimeMillis()
+                            }
+                        detailedBolusInfo.eventType = DetailedBolusInfo.EventType.CORRECTION_BOLUS
+                        detailedBolusInfo.insulin = oper.dose
+                        detailedBolusInfo.bolusType = DetailedBolusInfo.BolusType.TBR
+                        detailedBolusInfo.bolusTimestamp = System.currentTimeMillis()
+                        aapsLogger.debug(LTag.APS, "applyAPSRequest: bolus()")
+                        val callback = { o: PumpEnactResult? ->
+                            aapsLogger.info(LTag.PUMPBTCOMM, "temp basal bolus $o")
+                            if (o?.success == true) {
+                                tempBasalMicrobolusOperations.operations.poll()
+                            } else {
+                                oper.isCommandIssued = false
+                            }
+                            Unit
+                        }
+                        deliverTreatment(detailedBolusInfo, callback)
+                    }
                 }
             }
         }
+
         for ((key, value) in statusRefresh!!) {
             aapsLogger.info(
                 LTag.PUMP, "Next Command  ${
-                    (value!! - System.currentTimeMillis())}"
+                    (value!! - System.currentTimeMillis())
+                }"
             )
             aapsLogger.info(LTag.PUMP, key!!.name)
             if (value -
                 System.currentTimeMillis() <= 0
             ) {
-//                scheduleNextRefresh(refreshType.getKey());
+                //                scheduleNextRefresh(refreshType.getKey());
                 when (key) {
                     MedLinkMedtronicStatusRefreshType.PumpHistory -> {
                         aapsLogger.info(LTag.PUMPBTCOMM, "refreshing")
-                        readPumpHistory(true)
+                        readPumpData(true)
                     }
 
                     MedLinkMedtronicStatusRefreshType.PumpTime    -> {
@@ -890,22 +901,30 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                         refreshTypesNeededToReschedule.add(key)
                         resetTime = true
                     }
+
+                    else                                          -> {
+
+                    }
                 }
             }
         }
         if (statusRefreshMap.isEmpty() || System.currentTimeMillis() - lastTryToConnect >= 600000) {
+            val additionalMillis = if (statusRefreshMap.isEmpty()) {
+                300000L
+            } else 0L
             lastTryToConnect = System.currentTimeMillis()
-            readPumpHistory(false)
-            scheduleNextRefresh()
+            readPumpData(false)
+            // scheduleNextRefresh()
+            scheduleNextRefresh(MedLinkMedtronicStatusRefreshType.PumpHistory, additionalMillis);
             aapsLogger.info(LTag.PUMPBTCOMM, "posthistory")
-            //            scheduleNextRefresh(PumpHistory);
+
         }
         if (resetTime) medLinkPumpStatus.setLastCommunicationToNow()
     }
 
     private fun getStartStopCallback(
         operation: TempBasalMicroBolusPair?, callback: Function1<PumpEnactResult, *>,
-        function: ChangeStatusCallback, isConnect: Boolean
+        function: ChangeStatusCallback, isConnect: Boolean,
     ): Function<Supplier<Stream<String>>, MedLinkStandardReturn<PumpDriverState>> {
         return function.andThen(Function { f: MedLinkStandardReturn<PumpDriverState> ->
             when (f.functionResult) {
@@ -928,8 +947,8 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                             .comment(rh.gs(string.careportal_tempbasalend))
                     )
                     if (isConnect) {
-                        lastStatus = PumpStatusType.Running.status
-                        tempBasalMicrobolusOperations!!.operations.peek()
+                        lastStatus = PumpRunningState.Running.status
+                        tempBasalMicrobolusOperations.operations.peek()
                     } else {
                         operation?.isCommandIssued = false
                     }
@@ -944,13 +963,31 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                             .comment(rh.gs(string.careportal_tempbasalstart))
                     )
                     if (!isConnect) {
-                        lastStatus = PumpStatusType.Suspended.status
-                        tempBasalMicrobolusOperations!!.operations.peek()
+                        lastStatus = PumpRunningState.Suspended.status
+                        tempBasalMicrobolusOperations.operations.peek()
                         //                        createTemporaryBasalData(oper.getDuration(),
-//                                oper.getDose().setScale(2).doubleValue());
+                        //                                oper.getDose().setScale(2).doubleValue());
                     } else {
                         operation?.isCommandIssued = false
                     }
+                }
+
+                else                      -> {
+                    aapsLogger.info(LTag.PUMPBTCOMM, "else $operation")
+                    callback.invoke(
+                        PumpEnactResult(injector) //
+                            .success(!isConnect) //
+                            .enacted(!isConnect) //
+                            .comment(rh.gs(string.tempbasaldeliveryerror))
+                    )
+                    if (!isConnect) {
+                        lastStatus = PumpRunningState.Suspended.status
+                        tempBasalMicrobolusOperations.operations.peek()
+                        //                        createTemporaryBasalData(oper.getDuration(),
+                        //                                oper.getDose().setScale(2).doubleValue());
+                    }
+                    operation?.isCommandIssued = false
+
                 }
             }
             f
@@ -1005,7 +1042,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     private fun buildChangeStatusFunction(
         oper: TempBasalMicroBolusPair?,
         callback: Function1<PumpEnactResult, *>,
-        operationType: ChangeStatusCallback.OperationType
+        operationType: ChangeStatusCallback.OperationType,
     ): MutableList<CommandStructure<PumpDriverState, BleCommand>> {
         aapsLogger.info(LTag.PUMPBTCOMM, "changeStatusFunction")
         oper?.let { aapsLogger.info(LTag.PUMPBTCOMM, it.toStringView()) }
@@ -1015,32 +1052,37 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
             aapsLogger,
             operationType, this
         )
+        val commandPriority:CommandPriority
         val command: BleCommand
         val commandType: MedLinkCommandType
         if (operationType == ChangeStatusCallback.OperationType.START) {
             commandType = MedLinkCommandType.StartPump
             command = BleStartCommand(aapsLogger, medLinkService!!.medLinkServiceData, this)
+            commandPriority = CommandPriority.HIGH
         } else {
             commandType = MedLinkCommandType.StopPump
             command = BleStopCommand(aapsLogger, medLinkService!!.medLinkServiceData, this)
+            commandPriority = CommandPriority.LOWER
         }
+
         val startStopFunction =
             getStartStopCallback(oper, callback, function, true)
         return mutableListOf(
             CommandStructure(
                 MedLinkCommandType.StopStartPump, Optional.of(startStopFunction),
-                Optional.of(command)
+                Optional.of(command), commandPriority = commandPriority
             ), CommandStructure(
                 commandType, Optional.of(startStopFunction),
-                Optional.of(command)
+                Optional.of(command), commandPriority = commandPriority
             )
         )
+
     }
 
     override fun getPumpStatus(status: String) {
         when {
             status.lowercase(Locale.getDefault()) == "clicked refresh" -> {
-                readPumpHistory(false, 0L)
+                readPumpData(false, 0L)
             }
 
             firstRun                                                   -> {
@@ -1055,7 +1097,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     }
 
     fun sendChargingEvent() {
-//        rxBus.send(new EventChargingState(false, medLinkPumpStatus.batteryVoltage));
+        //        rxBus.send(new EventChargingState(false, medLinkPumpStatus.batteryVoltage));
     }
 
     fun sendPumpUpdateEvent() {
@@ -1074,7 +1116,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
             aapsLogger.info(LTag.PUMP, "nullmedlinkservice$medLinkService")
         }
         setRefreshButtonEnabled(false)
-        readPumpHistory(false, 0L)
+        readPumpData(false, 0L)
     }
 
     @SuppressLint("ResourceType") override fun postInit() {
@@ -1099,38 +1141,39 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                 MedLinkCommandType.Connect,
                 func,
                 btSleepTime,
-                BleConnectCommand(aapsLogger, medLinkService!!.medLinkServiceData, this)
+                BleConnectCommand(aapsLogger, medLinkService!!.medLinkServiceData, this),
+                CommandPriority.HIGH
             )
             medLinkService!!.medtronicUIComm?.executeCommandCP(message)
         } else {
             if (medLinkPumpStatus.medtronicDeviceType != medtronicUtil.medtronicPumpModel) {
-//                getAapsLogger().warn(LTag.PUMP, getLogPrefix() + "Configured pump is not the same as one detected.");
-//                medtronicUtil.sendNotification(MedtronicNotificationType.PumpTypeNotSame, getRh(), getRxBus());
+                //                getAapsLogger().warn(LTag.PUMP, getLogPrefix() + "Configured pump is not the same as one detected.");
+                //                medtronicUtil.sendNotification(MedtronicNotificationType.PumpTypeNotSame, getRh(), getRxBus());
             }
         }
         pumpState = PumpDriverState.Connected
 
         // time (1h)
-//        checkTimeAndOptionallySetTime();
+        //        checkTimeAndOptionallySetTime();
 
-//        readPumpHistory();
+        //        readPumpHistory();
 
         // remaining insulin (>50 = 4h; 50-20 = 1h; 15m)
-//        medLinkService.getMedtronicUIComm().executeCommand(MedLinkMedtronicCommandType.GetRemainingInsulin);
-//        scheduleNextRefresh(MedLinkMedtronicStatusRefreshType.RemainingInsulin, 10);
+        //        medLinkService.getMedtronicUIComm().executeCommand(MedLinkMedtronicCommandType.GetRemainingInsulin);
+        //        scheduleNextRefresh(MedLinkMedtronicStatusRefreshType.RemainingInsulin, 10);
 
         // remaining power (1h)
-//        medLinkService.getMedtronicUIComm().executeCommand(MedLinkMedtronicCommandType.GetBatteryStatus);
-//        scheduleNextRefresh(MedLinkMedtronicStatusRefreshType.BatteryStatus, 20);
+        //        medLinkService.getMedtronicUIComm().executeCommand(MedLinkMedtronicCommandType.GetBatteryStatus);
+        //        scheduleNextRefresh(MedLinkMedtronicStatusRefreshType.BatteryStatus, 20);
         aapsLogger.info(LTag.PUMPBTCOMM, "postinit")
         scheduleNextRefresh()
 
         // configuration (once and then if history shows config changes)
-//        medLinkService.getMedtronicUIComm().executeCommand(MedLinkMedtronicCommandType.getSettings(medtronicUtil.getMedtronicPumpModel()));
+        //        medLinkService.getMedtronicUIComm().executeCommand(MedLinkMedtronicCommandType.getSettings(medtronicUtil.getMedtronicPumpModel()));
 
         // read profile (once, later its controlled by isThisProfileSet method)
 
-//        if (initCommands.contains(getRh().gs(R.string.key_medlink_init_commands_profile))) {
+        //        if (initCommands.contains(getRh().gs(R.string.key_medlink_init_commands_profile))) {
         readPumpProfile()
         //        }
 
@@ -1166,10 +1209,8 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         this.readBolusHistory(false)
     }
 
-    fun readBolusHistory(previous: Boolean) {
-        if (sp.getBoolean(R.bool.key_medlink_init_commands_last_bolus_history, false)) {
-            medLinkService!!.medtronicUIComm?.executeCommandCP(bolusHistoryMessage(previous))
-        }
+    private fun readBolusHistory(previous: Boolean) {
+        medLinkService!!.medtronicUIComm?.executeCommandCP(bolusHistoryMessage(previous))
     }
 
     private fun bolusHistoryMessage(previous: Boolean): MedLinkPumpMessage<Stream<JSONObject>, Any> {
@@ -1184,12 +1225,14 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         return MedLinkPumpMessage(
             command,
             func,
-            btSleepTime, BleCommand(aapsLogger, medLinkService!!.medLinkServiceData)
+            btSleepTime, BlePartialCommand(aapsLogger, medLinkService!!.medLinkServiceData),
+            CommandPriority.NORMAL
         )
     }
 
     private fun previousBGHistory() {
         if ((activePlugin.activeBgSource as PluginBase).javaClass.canonicalName?.contains("MedLinkPlugin") == true) {
+            lastPreviousHistory = System.currentTimeMillis()
             medLinkService!!.medtronicUIComm?.executeCommandCP(previousBGHistory(false))
         }
     }
@@ -1202,7 +1245,8 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
             MedLinkCommandType.NoCommand,
             func,  //                isigFunc,
             btSleepTime,
-            BlePartialCommand(aapsLogger, medLinkService!!.medLinkServiceData)
+            BlePartialCommand(aapsLogger, medLinkService!!.medLinkServiceData),
+            CommandPriority.NORMAL
         )
     }
 
@@ -1216,20 +1260,20 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         }
         medtronicUtil.dismissNotification(MedtronicNotificationType.PumpUnreachable, rxBus)
 
-//        medLinkService.getMedtronicUIComm().executeCommand(MedLinkMedtronicCommandType.GetRealTimeClock);
+        //        medLinkService.getMedtronicUIComm().executeCommand(MedLinkMedtronicCommandType.GetRealTimeClock);
         val clock = medtronicUtil.pumpTime ?: return
 
-//        if (clock == null) { // retry
-//            medLinkService.getMedtronicUIComm().executeCommand(MedLinkMedtronicCommandType.GetRealTimeClock);
-//
-//            clock = medtronicUtil.getPumpTime();
-//        }
+        //        if (clock == null) { // retry
+        //            medLinkService.getMedtronicUIComm().executeCommand(MedLinkMedtronicCommandType.GetRealTimeClock);
+        //
+        //            clock = medtronicUtil.getPumpTime();
+        //        }
         val timeDiff = Math.abs(clock.timeDifference)
         if (timeDiff > 20) {
             if (clock.localDeviceTime.year <= 2015 || timeDiff <= 24 * 60 * 60) {
                 aapsLogger.info(LTag.PUMP, "MedtronicPumpPlugin::checkTimeAndOptionallySetTime - Time difference is {} s. Set time on pump.", timeDiff)
 
-//                medLinkService.getMedtronicUIComm().executeCommand(MedLinkMedtronicCommandType.SetRealTimeClock);
+                //                medLinkService.getMedtronicUIComm().executeCommand(MedLinkMedtronicCommandType.SetRealTimeClock);
                 if (clock.timeDifference == 0) {
                     val notification = Notification(Notification.INSIGHT_DATE_TIME_UPDATED, rh.gs(string.pump_time_updated), Notification.INFO, 60)
                     rxBus.send(EventNewNotification(notification))
@@ -1270,10 +1314,10 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
 
         medLinkService!!.medtronicUIComm?.executeCommandCP(msg)
 
-//        if (medtronicUITask.getResponseType() == MedtronicUIResponseType.Error) {
-//            getAapsLogger().info(LTag.PUMP, "reprocessing due to error response type");
-//            medLinkService.getMedtronicUIComm().executeCommandCP(msg);
-//        }
+        //        if (medtronicUITask.getResponseType() == MedtronicUIResponseType.Error) {
+        //            getAapsLogger().info(LTag.PUMP, "reprocessing due to error response type");
+        //            medLinkService.getMedtronicUIComm().executeCommandCP(msg);
+        //        }
     }
 
     private fun scheduleNextRefresh() {
@@ -1319,13 +1363,13 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     fun workWithStatusRefresh(
         action: StatusRefreshAction?,  //
         statusRefreshType: MedLinkMedtronicStatusRefreshType?,  //
-        time: Long
+        time: Long,
     ): Map<MedLinkMedtronicStatusRefreshType?, Long?>? {
         return when (action) {
             StatusRefreshAction.Add     -> {
                 aapsLogger.info(LTag.PUMPBTCOMM, DateTime(System.currentTimeMillis() + time).toString())
                 //                if(!statusRefreshMap.containsKey(statusRefreshType)) {
-                statusRefreshMap[statusRefreshType] = time
+                statusRefreshMap[statusRefreshType] = pumpStatusData.lastConnection + time
                 //                }
                 null
             }
@@ -1342,11 +1386,11 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         aapsLogger.debug(LTag.PUMP, "isThisProfileSet: basalInitalized=" + medLinkPumpStatus.basalProfileStatus)
         if (!isInitialized) return true
 
-//        if (medtronicPumpStatus.basalProfileStatus == BasalProfileStatus.NotInitialized) {
-//            // this shouldn't happen, but if there was problem we try again
-//            getPumpProfile();
-//            return isProfileSame(profile);
-//        } else
+        //        if (medtronicPumpStatus.basalProfileStatus == BasalProfileStatus.NotInitialized) {
+        //            // this shouldn't happen, but if there was problem we try again
+        //            getPumpProfile();
+        //            return isProfileSame(profile);
+        //        } else
         return if (medLinkPumpStatus.basalProfileStatus === BasalProfileStatus.ProfileChanged) {
             false
         } else medLinkPumpStatus.basalProfileStatus !== BasalProfileStatus.ProfileOK || isProfileSame(profile)
@@ -1426,19 +1470,19 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
             medLinkPumpStatus.tempBasalLength
         )
         //        MedtronicUITask responseTask = null;//rileyLinkMedtronicService.getMedtronicUIComm().executeCommand(MedtronicCommandType.ReadTemporaryBasal);
-//
-//        if (responseTask.hasData()) {
-//            TempBasalPair tbr = (TempBasalPair) responseTask.returnData;
-//
-//            // we sometimes get rate returned even if TBR is no longer running
-//            if (tbr.getDurationMinutes() == 0) {
-//                tbr.setInsulinRate(0.0d);
-//            }
-//
-//            return tbr;
-//        } else {
-//            return null;
-//        }
+        //
+        //        if (responseTask.hasData()) {
+        //            TempBasalPair tbr = (TempBasalPair) responseTask.returnData;
+        //
+        //            // we sometimes get rate returned even if TBR is no longer running
+        //            if (tbr.getDurationMinutes() == 0) {
+        //                tbr.setInsulinRate(0.0d);
+        //            }
+        //
+        //            return tbr;
+        //        } else {
+        //            return null;
+        //        }
     }
 
     private fun finishAction(overviewKey: String?) {
@@ -1457,7 +1501,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     // if false and the same rate is requested enacted=false and success=true is returned and TBR is not changed
     override fun setTempBasalAbsolute(
         absoluteRate: Double, durationInMinutes: Int, profile: Profile,
-        enforceNew: Boolean, callback: Function1<PumpEnactResult, *>
+        enforceNew: Boolean, callback: Function1<PumpEnactResult, *>,
     ) {
         val result: PumpEnactResult
         checkPumpNeedToBeStarted(absoluteRate, profile)
@@ -1470,7 +1514,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
             aapsLogger.info(LTag.EVENTS, "" + baseBasalRate)
             aapsLogger.info(LTag.EVENTS, "" + absoluteRate)
             aapsLogger.info(LTag.EVENTS, "" + pumpDescription.bolusStep)
-            tempBasalMicrobolusOperations!!.operations.clear()
+            tempBasalMicrobolusOperations.operations.clear()
             clearTempBasal()
             PumpEnactResult(injector).enacted(true).success(true)
         } else if (temporaryBasal != null && temporaryBasal!!.desiredRate == absoluteRate && absoluteRate == 0.0) {
@@ -1490,7 +1534,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                 aapsLogger.info(LTag.EVENTS, "" + baseBasalRate)
                 aapsLogger.info(LTag.EVENTS, "" + absoluteRate)
                 aapsLogger.info(LTag.EVENTS, "" + pumpDescription.bolusStep)
-                tempBasalMicrobolusOperations!!.clearOperations()
+                tempBasalMicrobolusOperations.clearOperations()
                 scheduleSuspension(
                     0, durationInMinutes, profile, callback,
                     absoluteRate,
@@ -1508,7 +1552,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                 )
             }
             //        result.success = false;
-//        result.comment = MainApp.gs(R.string.pumperror);
+            //        result.comment = MainApp.gs(R.string.pumperror);
         }
 
         aapsLogger.info(LTag.EVENTS, "Settings temp basal percent: $result")
@@ -1517,7 +1561,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
 
     fun setTempBasalAbsolute(
         absoluteRate: Double, durationInMinutes: Int, profile: Profile,
-        enforceNew: Boolean
+        enforceNew: Boolean,
     ): PumpEnactResult {
         checkPumpNeedToBeStarted(absoluteRate, profile)
         setRefreshButtonEnabled(false)
@@ -1534,14 +1578,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
 
         // read current TBR
         val tbrCurrent = readTBR()
-        if (tbrCurrent == null) {
-            aapsLogger.warn(LTag.PUMP, logPrefix + "setTempBasalAbsolute - Could not read current TBR, canceling operation.")
-            finishAction("TBR")
-            return PumpEnactResult(injector).success(false).enacted(false)
-                .comment(rh.gs(string.medtronic_cmd_cant_read_tbr))
-        } else {
-            aapsLogger.info(LTag.PUMP, logPrefix + "setTempBasalAbsolute: Current Basal: duration: " + tbrCurrent.durationMinutes + " min, rate=" + tbrCurrent.insulinRate)
-        }
+        aapsLogger.info(LTag.PUMP, logPrefix + "setTempBasalAbsolute: Current Basal: duration: " + tbrCurrent.durationMinutes + " min, rate=" + tbrCurrent.insulinRate)
         if (!enforceNew) {
             if (MedLinkMedtronicUtil.isSame(tbrCurrent.insulinRate, absoluteRate)) {
                 var sameRate = true
@@ -1576,12 +1613,12 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
             ).show()
             //            Boolean response = (Boolean) responseTask2.returnData;
 
-//            if (response) {
-//                getAapsLogger().info(LTag.PUMP, getLogPrefix() + "setTempBasalAbsolute - Current TBR cancelled.");
-//            } else {
-//                getAapsLogger().error(getLogPrefix() + "setTempBasalAbsolute - Cancel TBR failed.");
-//
-//                finishAction("TBR");
+            //            if (response) {
+            //                getAapsLogger().info(LTag.PUMP, getLogPrefix() + "setTempBasalAbsolute - Current TBR cancelled.");
+            //            } else {
+            //                getAapsLogger().error(getLogPrefix() + "setTempBasalAbsolute - Cancel TBR failed.");
+            //
+            //                finishAction("TBR");
             return PumpEnactResult(injector).success(false).enacted(false)
                 .comment(rh.gs(string.medtronic_cmd_cant_cancel_tbr_stop_op))
             //            }
@@ -1589,46 +1626,47 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         return PumpEnactResult(injector).success(false).enacted(false)
             .comment(rh.gs(string.medtronic_cmd_cant_cancel_tbr_stop_op))
         // now start new TBR
-//        MedtronicUITask responseTask = null;//rileyLinkMedtronicService.getMedtronicUIComm().executeCommand(MedtronicCommandType.SetTemporaryBasal,
-//        //absoluteRate, durationInMinutes);
-//
-//        Boolean response = (Boolean) responseTask.returnData;
-//
-//        getAapsLogger().info(LTag.PUMP, getLogPrefix() + "setTempBasalAbsolute - setTBR. Response: " + response);
-//
-//        if (response) {
-//            // FIXME put this into UIPostProcessor
-//            medtronicPumpStatus.tempBasalStart = new Date();
-//            medtronicPumpStatus.tempBasalAmount = absoluteRate;
-//            medtronicPumpStatus.tempBasalLength = durationInMinutes;
-//
-//            TemporaryBasal tempStart = new TemporaryBasal(getInjector()) //
-//                    .date(System.currentTimeMillis()) //
-//                    .duration(durationInMinutes) //
-//                    .absolute(absoluteRate) //
-//                    .source(Source.USER);
-//
-//            activePlugin.getActiveTreatments().addToHistoryTempBasal(tempStart);
-//
-//            incrementStatistics(MedtronicConst.Statistics.TBRsSet);
-//
-//            finishAction("TBR");
-//
-//            return new PumpEnactResult(getInjector()).success(true).enacted(true) //
-//                    .absolute(absoluteRate).duration(durationInMinutes);
-//
-//        } else {
-//            finishAction("TBR");
-//
-//            return new PumpEnactResult(getInjector()).success(false).enacted(false) //
-//                    .comment(getRh().gs(R.string.medtronic_cmd_tbr_could_not_be_delivered));
-//        }
+        //        MedtronicUITask responseTask = null;//rileyLinkMedtronicService.getMedtronicUIComm().executeCommand(MedtronicCommandType.SetTemporaryBasal,
+        //        //absoluteRate, durationInMinutes);
+        //
+        //        Boolean response = (Boolean) responseTask.returnData;
+        //
+        //        getAapsLogger().info(LTag.PUMP, getLogPrefix() + "setTempBasalAbsolute - setTBR. Response: " + response);
+        //
+        //        if (response) {
+        //            // FIXME put this into UIPostProcessor
+        //            medtronicPumpStatus.tempBasalStart = new Date();
+        //            medtronicPumpStatus.tempBasalAmount = absoluteRate;
+        //            medtronicPumpStatus.tempBasalLength = durationInMinutes;
+        //
+        //            TemporaryBasal tempStart = new TemporaryBasal(getInjector()) //
+        //                    .date(System.currentTimeMillis()) //
+        //                    .duration(durationInMinutes) //
+        //                    .absolute(absoluteRate) //
+        //                    .source(Source.USER);
+        //
+        //            activePlugin.getActiveTreatments().addToHistoryTempBasal(tempStart);
+        //
+        //            incrementStatistics(MedtronicConst.Statistics.TBRsSet);
+        //
+        //            finishAction("TBR");
+        //
+        //            return new PumpEnactResult(getInjector()).success(true).enacted(true) //
+        //                    .absolute(absoluteRate).duration(durationInMinutes);
+        //
+        //        } else {
+        //            finishAction("TBR");
+        //
+        //            return new PumpEnactResult(getInjector()).success(false).enacted(false) //
+        //                    .comment(getRh().gs(R.string.medtronic_cmd_tbr_could_not_be_delivered));
+        //        }
     }
 
     private fun checkPumpNeedToBeStarted(absoluteRate: Double, profile: Profile) {
         val previousBasal = temporaryBasal
         if (previousBasal != null) {
             if (absoluteRate > 0.0 && previousBasal.desiredRate!! < profile.getBasal()) {
+                aapsLogger.info(LTag.CORE, "starting pump")
                 startPump(object : Callback() {
                     override fun run() {}
                 })
@@ -1639,10 +1677,12 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     protected fun clearTempBasal(): PumpEnactResult {
         aapsLogger.info(LTag.EVENTS, " clearing temp basal")
         val result = buildPumpEnactResult()
-        tempBasalMicrobolusOperations!!.clearOperations()
+        tempBasalMicrobolusOperations.clearOperations()
         result.success = true
         result.comment = rh.gs(string.canceltemp)
-        if (pumpStatusData.pumpStatusType == PumpStatusType.Suspended) {
+        if (pumpStatusData.pumpRunningState == PumpRunningState.Suspended) {
+            aapsLogger.info(LTag.EVENTS, "starting pump")
+
             startPump(object : Callback() {
                 override fun run() {
                     aapsLogger.info(LTag.EVENTS, "temp basal cleared")
@@ -1656,7 +1696,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     private fun buildSuspensionScheduler(
         totalSuspendedMinutes: Int,  //                                                                                  Integer suspensions,
         durationInMinutes: Int,
-        callback: Function1<*, *>
+        callback: Function1<*, *>,
     ): LinkedBlockingDeque<TempBasalMicroBolusPair> {
         var mod = 0
         var mergeOperations = 0
@@ -1711,16 +1751,16 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                     possibleSuspensions -= mergeOperations
                 }
             }
-//        operationDuration = Double.valueOf(totalSuspendedMinutes) / Double.valueOf(suspensions);
-//        if (operationDuration < Constants.INTERVAL_BETWEEN_OPERATIONS) {
-//            operationDuration = (double) Constants.INTERVAL_BETWEEN_OPERATIONS;
-//        }
-//        mod = operationDuration % Constants.INTERVAL_BETWEEN_OPERATIONS;
-//        if ((mod / Constants.INTERVAL_BETWEEN_OPERATIONS) > 0.5) {
-//            operationDuration += Constants.INTERVAL_BETWEEN_OPERATIONS - mod;
-//        } else {
-//            operationDuration -= mod;
-//        }
+            //        operationDuration = Double.valueOf(totalSuspendedMinutes) / Double.valueOf(suspensions);
+            //        if (operationDuration < Constants.INTERVAL_BETWEEN_OPERATIONS) {
+            //            operationDuration = (double) Constants.INTERVAL_BETWEEN_OPERATIONS;
+            //        }
+            //        mod = operationDuration % Constants.INTERVAL_BETWEEN_OPERATIONS;
+            //        if ((mod / Constants.INTERVAL_BETWEEN_OPERATIONS) > 0.5) {
+            //            operationDuration += Constants.INTERVAL_BETWEEN_OPERATIONS - mod;
+            //        } else {
+            //            operationDuration -= mod;
+            //        }
         }
         val nextStartStop = NextStartStop()
         var startStopDateTime = nextStartStop.getNextStartStop(operationDuration, operationInterval)
@@ -1762,7 +1802,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     }
 
     private fun mergeExtraOperations(
-        operations: LinkedBlockingDeque<TempBasalMicroBolusPair>, mod: Int, suspensions: Int
+        operations: LinkedBlockingDeque<TempBasalMicroBolusPair>, mod: Int, suspensions: Int,
     ): LinkedBlockingDeque<TempBasalMicroBolusPair> {
         var deltaMod = mod * suspensions
         var previousReleaseTime: LocalDateTime? = null
@@ -1794,7 +1834,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         profile: Profile,
         callback: Function1<*, *>,
         absoluteBasalValue: Double,
-        pumpTempBasalType: PumpTempBasalType
+        pumpTempBasalType: PumpTempBasalType,
     ): PumpEnactResult? {
         this.durationInMinutes = durationInMinutes
         var totalSuspendedMinutes = 0
@@ -1814,39 +1854,41 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         if (totalSuspendedMinutes < Constants.INTERVAL_BETWEEN_OPERATIONS) {
             return result
         } else {
-//            int suspensions;
-//            if (totalSuspendedMinutes < durationInMinutes / 2) {
-//                suspensions = new BigDecimal(totalSuspendedMinutes)
-//                        .divide(new BigDecimal(Constants.INTERVAL_BETWEEN_OPERATIONS), RoundingMode.HALF_UP)
-//                        .setScale(0, RoundingMode.HALF_UP).intValue();
-//            } else {
-////                int delta = durationInMinutes - ;
-//                suspensions = totalSuspendedMinutes / Constants.INTERVAL_BETWEEN_OPERATIONS;
-//                if (suspensions == 0) {
-//                    suspensions++;
-//                }
-//            }
+            //            int suspensions;
+            //            if (totalSuspendedMinutes < durationInMinutes / 2) {
+            //                suspensions = new BigDecimal(totalSuspendedMinutes)
+            //                        .divide(new BigDecimal(Constants.INTERVAL_BETWEEN_OPERATIONS), RoundingMode.HALF_UP)
+            //                        .setScale(0, RoundingMode.HALF_UP).intValue();
+            //            } else {
+            ////                int delta = durationInMinutes - ;
+            //                suspensions = totalSuspendedMinutes / Constants.INTERVAL_BETWEEN_OPERATIONS;
+            //                if (suspensions == 0) {
+            //                    suspensions++;
+            //                }
+            //            }
 
             //TODO need to reavaluate some cases, used floor here to avoid two possible up rounds
             val operations = buildSuspensionScheduler(
                 totalSuspendedMinutes, durationInMinutes, callback
             )
-            tempBasalMicrobolusOperations!!.updateOperations(
+            tempBasalMicrobolusOperations.updateOperations(
                 operations.size, 0.0,
                 operations,
                 totalSuspendedMinutes
             )
-            tempBasalMicrobolusOperations!!.absoluteRate = absoluteBasalValue
+            tempBasalMicrobolusOperations.absoluteRate = absoluteBasalValue
             tempBasalMicrobolusOperations.let {
                 if (it != null && it.operations.isNotEmpty() &&
                     it.operations.first.operationType == TempBasalMicroBolusPair.OperationType.SUSPEND &&
-                    pumpStatusData.pumpStatusType == PumpStatusType.Suspended && it.operations.first.releaseTime.isBefore(LocalDateTime.now())
+                    pumpStatusData.pumpRunningState == PumpRunningState.Suspended && it.operations.first.releaseTime.isBefore(LocalDateTime.now())
                 ) {
                     operations.removeFirst()
                 } else if (it != null && it.operations.isNotEmpty() &&
                     it.operations.first.operationType == TempBasalMicroBolusPair.OperationType.SUSPEND &&
-                    pumpStatusData.pumpStatusType == PumpStatusType.Suspended && percent > 0
+                    pumpStatusData.pumpRunningState == PumpRunningState.Suspended && percent > 0
                 ) {
+                    aapsLogger.info(LTag.EVENTS, "temp basal starting pump")
+
                     startPump(object : Callback() {
                         override fun run() {}
                     })
@@ -1869,7 +1911,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     private fun buildFirstLevelTempBasalMicroBolusOperations(
         percent: Int, basalProfilesFromTemp: LinkedList<ProfileValue?>,
         durationInMinutes: Int, callback: Function1<*, *>, absoluteBasalValue: Double,
-        basalType: PumpTempBasalType
+        basalType: PumpTempBasalType,
     ): TempBasalMicrobolusOperations {
         val insulinPeriod: MutableList<TempBasalMicroBolusDTO> = ArrayList()
         var previousProfileValue: ProfileValue? = null
@@ -1944,7 +1986,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         basalProfilesFromTemp: LinkedList<ProfileValue?>,
         percent: Int, abs: Double,
         remainingDurationInSeconds: Int,
-        basalType: PumpTempBasalType
+        basalType: PumpTempBasalType,
     ): TempBasalMicroBolusDTO {
         var delta = 0
         if (basalProfilesFromTemp.isEmpty()) {
@@ -1967,7 +2009,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
 
     private fun createTempBasalPair(
         totalAmount: Double, durationInSeconds: Int,
-        startTime: Int, basalType: PumpTempBasalType
+        startTime: Int, basalType: PumpTempBasalType,
     ): TempBasalMicroBolusDTO {
         return TempBasalMicroBolusDTO(
             totalAmount, basalType == PumpTempBasalType.Percent, durationInSeconds / 60,
@@ -1977,7 +2019,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
 
     private fun calcTotalAmountPct(
         tempBasal: Int, currentBasalValue: Double,
-        durationInMinutes: Int
+        durationInMinutes: Int,
     ): Double {
         var tempBasal = tempBasal
         if (tempBasal > 100) {
@@ -1988,7 +2030,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
 
     private fun calcTotalAmountAbs(
         tempBasal: Double, currentBasalValue: Double,
-        durationInMinutes: Int
+        durationInMinutes: Int,
     ): Double {
         return (tempBasal - currentBasalValue) * (durationInMinutes / 60.0)
     }
@@ -2005,7 +2047,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         insulinPeriod: List<TempBasalMicroBolusDTO>,
         callback: Function1<*, *>,
         durationInMinutes: Int,
-        absoluteRate: Double
+        absoluteRate: Double,
     ): TempBasalMicrobolusOperations {
         val result = TempBasalMicrobolusOperations()
         result.durationInMinutes = durationInMinutes
@@ -2074,7 +2116,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     private fun excludeExtraDose(
         totalDose: Double,
         totalAmount: Double,
-        result: TempBasalMicrobolusOperations
+        result: TempBasalMicrobolusOperations,
     ): LinkedBlockingDeque<TempBasalMicroBolusPair> {
         var dosesToDecrease = round((totalDose - totalAmount) / pumpType.bolusSize).toInt()
         val maxDosage = result.operations.stream().map { obj: TempBasalMicroBolusPair -> obj.dose }
@@ -2155,7 +2197,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         return if (doses == 0.0) {
             list
         } else {
-            aapsLogger.info(LTag.PUMPBTCOMM, "unrecheable?")
+            aapsLogger.info(LTag.PUMPBTCOMM, "unreachable?")
             //TODO unreachable code
             buildOperations(doses, operations, list)
         }
@@ -2221,7 +2263,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
 
     private fun scheduleTempBasalBolus(
         percent: Int, durationInMinutes: Int,
-        profile: Profile, callback: Function1<*, *>, absoluteBasalValue: Double, basalType: PumpTempBasalType
+        profile: Profile, callback: Function1<*, *>, absoluteBasalValue: Double, basalType: PumpTempBasalType,
     ): PumpEnactResult {
         val currentTime = currentTime
         val currentTas = currentTime.millisOfDay / 1000
@@ -2298,17 +2340,19 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
 
     override fun setTempBasalPercent(
         percent: Int, durationInMinutes: Int,
-        profile: Profile, enforceNew: Boolean, callback: Function1<PumpEnactResult, *>
+        profile: Profile, enforceNew: Boolean, callback: Function1<PumpEnactResult, *>,
     ): PumpEnactResult {
         if (temporaryBasal != null) {
             val previousBasal = temporaryBasal
-            if ((pumpStatusData.pumpStatusType == PumpStatusType.Suspended || (previousBasal?.desiredPct != null && previousBasal.desiredPct!! < 100)) && percent >= 100) {
+            if ((pumpStatusData.pumpRunningState == PumpRunningState.Suspended || (previousBasal?.desiredPct != null && previousBasal.desiredPct!! < 100)) && percent >= 100) {
+                aapsLogger.info(LTag.EVENTS, "temp basal starting pump")
+
                 startPump(object : Callback() {
                     override fun run() {}
                 })
             }
         }
-        tempBasalMicrobolusOperations!!.operations.clear()
+        tempBasalMicrobolusOperations.operations.clear()
         val result: PumpEnactResult = when {
             percent == 100 -> {
                 clearTempBasal()
@@ -2329,18 +2373,18 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
             }
         }
         //        result.success = false;
-//        result.comment = MainApp.gs(R.string.pumperror);
+        //        result.comment = MainApp.gs(R.string.pumperror);
         aapsLogger.info(LTag.DATATREATMENTS, "Settings temp basal percent: $result")
         return result
     }
 
-// fun setExtendedBolus(insulin: Double?, durationInMinutes: Int?): PumpEnactResult {
-//     val result = buildPumpEnactResult()
-//     result.success = false
-//     medtronicUtil.sendNotification(MedtronicNotificationType.PumpExtendedBolusNotEnabled, rh, rxBus)
-//     aapsLogger.debug("Setting extended bolus: $result")
-//     return result
-// }
+    // fun setExtendedBolus(insulin: Double?, durationInMinutes: Int?): PumpEnactResult {
+    //     val result = buildPumpEnactResult()
+    //     result.success = false
+    //     medtronicUtil.sendNotification(MedtronicNotificationType.PumpExtendedBolusNotEnabled, rh, rxBus)
+    //     aapsLogger.debug("Setting extended bolus: $result")
+    //     return result
+    // }
 
     override fun cancelTempBasal(enforceNew: Boolean, callback: Callback?) {
         aapsLogger.info(LTag.PUMP, logPrefix + "cancelTempBasal - started")
@@ -2365,7 +2409,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
             var first = tempBasalMicrobolusOperations?.operations?.first
             if ((first?.operationType == TempBasalMicroBolusPair.OperationType.REACTIVATE && !first.isCommandIssued) ||
                 (first?.operationType == TempBasalMicroBolusPair.OperationType.SUSPEND && first.isCommandIssued) ||
-                medLinkPumpStatus.pumpStatusType == PumpStatusType.Suspended
+                medLinkPumpStatus.pumpRunningState == PumpRunningState.Suspended
             ) {
                 startPump(callback)
             }
@@ -2389,9 +2433,9 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     }
 
     override fun extendBasalTreatment(duration: Int, callback: Function1<PumpEnactResult, *>): PumpEnactResult {
-//TODO implement
+        //TODO implement
         val result = PumpEnactResult(injector).success(true).enacted(true).comment(rh.gs(string.let_temp_basal_run))
-        val reactivateOper = tempBasalMicrobolusOperations!!.operations.stream().filter { f: TempBasalMicroBolusPair ->
+        val reactivateOper = tempBasalMicrobolusOperations.operations.stream().filter { f: TempBasalMicroBolusPair ->
             f.operationType ==
                 TempBasalMicroBolusPair.OperationType.REACTIVATE
         }.findFirst()
@@ -2402,13 +2446,13 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         return result
     }
 
-// override fun cancelExtendedBolus(): PumpEnactResult {
-//     val result = PumpEnactResult(injector)
-//     result.success = false
-//     medtronicUtil.sendNotification(MedtronicNotificationType.No, rh, rxBus)
-//     aapsLogger.debug("Canceling extended bolus: $result")
-//     return result
-// }
+    // override fun cancelExtendedBolus(): PumpEnactResult {
+    //     val result = PumpEnactResult(injector)
+    //     result.success = false
+    //     medtronicUtil.sendNotification(MedtronicNotificationType.No, rh, rxBus)
+    //     aapsLogger.debug("Canceling extended bolus: $result")
+    //     return result
+    // }
 
     override fun manufacturer(): ManufacturerType {
         return ManufacturerType.Medtronic
@@ -2424,59 +2468,59 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     }
 
     //    @Override public PumpType getPumpType() {
-//        return pumpDescription.pumpType;
-//    }
+    //        return pumpDescription.pumpType;
+    //    }
     override fun serialNumber(): String {
         return medLinkPumpStatus.serialNumber
     }
 
-// override fun shortStatus(veryShort: Boolean): String {
-//     var ret = ""
-//     if (pumpStatusData.lastConnection != 0L) {
-//         val agoMsec = System.currentTimeMillis() - pumpStatusData.lastConnection
-//         val agoMin = (agoMsec / 60.0 / 1000.0).toInt()
-//         ret += "LastConn: $agoMin min agon"
-//     }
-//     if (pumpStatusData.lastBolusTime != null && pumpStatusData.lastBolusTime!!.time != 0L) {
-//         ret += """
-//             LastBolus: ${to2Decimal(pumpStatusData.lastBolusAmount!!)}U @${DateFormat.format("HH:mm", pumpStatusData.lastBolusTime)}
-//
-//             """.trimIndent()
-//     }
-//     val activeTemp: TemporaryBasal = activePlugin.getActiveTreatments().getRealTempBasalFromHistory(System.currentTimeMillis())
-//     if (activeTemp != null) {
-//         ret += """
-//             Temp: ${activeTemp.toStringFull().toString()}
-//
-//             """.trimIndent()
-//     }
-//     val activeExtendedBolus: ExtendedBolus = activePlugin.getActiveTreatments().getExtendedBolusFromHistory(
-//         System.currentTimeMillis()
-//     )
-//     if (activeExtendedBolus != null) {
-//         ret += """
-//             Extended: ${activeExtendedBolus.toString().toString()}
-//
-//             """.trimIndent()
-//     }
-//     // if (!veryShort) {
-//     // ret += "TDD: " + DecimalFormatter.to0Decimal(pumpStatus.dailyTotalUnits) + " / "
-//     // + pumpStatus.maxDailyTotalUnits + " Un";
-//     // }
-//     ret += """
-//         IOB: ${pumpStatusData.iob}U
-//
-//         """.trimIndent()
-//     ret += """
-//         Reserv: ${to0Decimal(pumpStatusData.reservoirLevel)}U
-//
-//         """.trimIndent()
-//     ret += """
-//         Batt: ${pumpStatusData.batteryVoltage}
-//
-//         """.trimIndent()
-//     return ret
-// }
+    // override fun shortStatus(veryShort: Boolean): String {
+    //     var ret = ""
+    //     if (pumpStatusData.lastConnection != 0L) {
+    //         val agoMsec = System.currentTimeMillis() - pumpStatusData.lastConnection
+    //         val agoMin = (agoMsec / 60.0 / 1000.0).toInt()
+    //         ret += "LastConn: $agoMin min agon"
+    //     }
+    //     if (pumpStatusData.lastBolusTime != null && pumpStatusData.lastBolusTime!!.time != 0L) {
+    //         ret += """
+    //             LastBolus: ${to2Decimal(pumpStatusData.lastBolusAmount!!)}U @${DateFormat.format("HH:mm", pumpStatusData.lastBolusTime)}
+    //
+    //             """.trimIndent()
+    //     }
+    //     val activeTemp: TemporaryBasal = activePlugin.getActiveTreatments().getRealTempBasalFromHistory(System.currentTimeMillis())
+    //     if (activeTemp != null) {
+    //         ret += """
+    //             Temp: ${activeTemp.toStringFull().toString()}
+    //
+    //             """.trimIndent()
+    //     }
+    //     val activeExtendedBolus: ExtendedBolus = activePlugin.getActiveTreatments().getExtendedBolusFromHistory(
+    //         System.currentTimeMillis()
+    //     )
+    //     if (activeExtendedBolus != null) {
+    //         ret += """
+    //             Extended: ${activeExtendedBolus.toString().toString()}
+    //
+    //             """.trimIndent()
+    //     }
+    //     // if (!veryShort) {
+    //     // ret += "TDD: " + DecimalFormatter.to0Decimal(pumpStatus.dailyTotalUnits) + " / "
+    //     // + pumpStatus.maxDailyTotalUnits + " Un";
+    //     // }
+    //     ret += """
+    //         IOB: ${pumpStatusData.iob}U
+    //
+    //         """.trimIndent()
+    //     ret += """
+    //         Reserv: ${to0Decimal(pumpStatusData.reservoirLevel)}U
+    //
+    //         """.trimIndent()
+    //     ret += """
+    //         Batt: ${pumpStatusData.batteryVoltage}
+    //
+    //         """.trimIndent()
+    //     return ret
+    // }
 
     override fun getCustomActions(): List<CustomAction>? {
         if (customActions == null) {
@@ -2507,7 +2551,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
             MedtronicCustomActionType.ClearBolusBlock             -> {
                 busyTimestamps.clear()
 
-//                this.customActionClearBolusBlock.setEnabled(false);
+                //                this.customActionClearBolusBlock.setEnabled(false);
                 refreshCustomActionsList()
             }
 
@@ -2546,13 +2590,13 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         }
         return if (this.profile == null) {
 
-//            this.setNewBasalProfile(profile);
+            //            this.setNewBasalProfile(profile);
             PumpEnactResult(injector) //
                 .success(false) //
                 .enacted(false) //
                 .comment(rh.gs(string.medtronic_cmd_set_profile_pattern_overflow, profile.basalProfileToString()))
         } else if (convertProfileToMedtronicProfile(this.profile) != profile) {
-//            getAapsLogger().info(LTag.PUMPBTCOMM,profile.toString());
+            //            getAapsLogger().info(LTag.PUMPBTCOMM,profile.toString());
             aapsLogger.info(LTag.PUMPBTCOMM, this.profile.toString())
             Toast.makeText(
                 context,
@@ -2613,19 +2657,19 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                 Toast.makeText(context, rh.gs(string.medtronic_cmd_basal_profile_could_not_be_set, 40), Toast.LENGTH_LONG).show()
             }
         })
-//        MedtronicUITask responseTask = medLinkService.getMedtronicUIComm().executeCommand(MedLinkMedtronicCommandType.SetBasalProfileSTD,
-//                basalProfile);
-//
-//        Boolean response = (Boolean) responseTask.returnData;
-//
-//        getAapsLogger().info(LTag.PUMP, getLogPrefix() + "Basal Profile was set: " + response);
-//
-//        if (response) {
+        //        MedtronicUITask responseTask = medLinkService.getMedtronicUIComm().executeCommand(MedLinkMedtronicCommandType.SetBasalProfileSTD,
+        //                basalProfile);
+        //
+        //        Boolean response = (Boolean) responseTask.returnData;
+        //
+        //        getAapsLogger().info(LTag.PUMP, getLogPrefix() + "Basal Profile was set: " + response);
+        //
+        //        if (response) {
         return PumpEnactResult(injector).success(false).enacted(false)
         //        } else {
-//            return new PumpEnactResult(getInjector()).success(response).enacted(response) //
-//                    .comment(getRh().gs(R.string.medtronic_cmd_basal_profile_could_not_be_set));
-//        }
+        //            return new PumpEnactResult(getInjector()).success(response).enacted(response) //
+        //                    .comment(getRh().gs(R.string.medtronic_cmd_basal_profile_could_not_be_set));
+        //        }
     }
 
     private fun isProfileValid(basalProfile: BasalProfile): String? {
@@ -2688,14 +2732,14 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     override fun deliverBolus(detailedBolusInfo: DetailedBolusInfo): PumpEnactResult {
         aapsLogger.info(LTag.PUMP, "MedtronicPumpPlugin::deliverBolus - " + MedtronicPumpPluginInterface.BolusDeliveryType.DeliveryPrepared)
         setRefreshButtonEnabled(false)
-        if (detailedBolusInfo.insulin > medLinkPumpStatus.reservoirLevel) {
+        if (detailedBolusInfo.insulin > medLinkPumpStatus.reservoirRemainingUnits) {
             return PumpEnactResult(injector) //
                 .success(false) //
                 .enacted(false) //
                 .comment(
                     rh.gs(
                         string.medtronic_cmd_bolus_could_not_be_delivered_no_insulin,
-                        medLinkPumpStatus.reservoirLevel,
+                        medLinkPumpStatus.reservoirRemainingUnits,
                         detailedBolusInfo.insulin
                     )
                 )
@@ -2714,7 +2758,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         // LOG.debug("MedtronicPumpPlugin::deliverBolus - Starting wait period.");
         val sleepTime = sp.getInt(MedtronicConst.Prefs.BolusDelay, 10) * 1000
 
-//        SystemClock.sleep(sleepTime);
+        //        SystemClock.sleep(sleepTime);
         return if (bolusDeliveryType == MedtronicPumpPluginInterface.BolusDeliveryType.CancelDelivery) {
             // LOG.debug("MedtronicPumpPlugin::deliverBolus - Delivery Canceled, before wait period.");
             setNotReachable(true, true)
@@ -2724,30 +2768,16 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
             // LOG.debug("MedtronicPumpPlugin::deliverBolus - Start delivery");
             val response = AtomicReference(false)
             // val bolusTimesstamp = 0L
-            val bolusCallback = BolusCallback(aapsLogger)
-            val andThem: Function<Supplier<Stream<String>>, MedLinkStandardReturn<String>> = bolusCallback.andThen({ f: MedLinkStandardReturn<BolusAnswer> ->
-                                                                                                                       val answer = f.functionResult
-//                if (answer.response == PumpResponses.BolusDelivered &&
-//                        answer.bolusAmount == detailedBolusInfo.insulin
-//                ) {
-//                    detailedBolusInfo.timestamp = answer.bolusDeliveryTime.toInstant().toEpochMilli()
-//                    detailedBolusInfo.deliverAtTheLatest = answer.bolusDeliveryTime.toInstant().toEpochMilli()
-//                    handleNewTreatmentData(Stream.of(JSONObject(detailedBolusInfo.toJsonString())))
-//                } else if (answer.response == PumpResponses.DeliveringBolus) {
-//                    lastDetailedBolusInfo = detailedBolusInfo
-//                    lastBolusTime = System.currentTimeMillis()
-//                    aapsLogger.info(LTag.PUMPBTCOMM, "pump is delivering")
-//                    response.set(true)
-//                    //                    bolusInProgress(detailedBolusInfo, bolusDeliveryTime);
-////                    processDeliveredBolus(answer, detailedBolusInfo);
-//                } else
-                                                                                                                       if (answer.response == PumpResponses.UnknownAnswer) {
-                                                                                                                           aapsLogger.info(LTag.PUMPBTCOMM, "need to check bolus")
-                                                                                                                           //                    processDeliveredBolus(answer, detailedBolusInfo);
-                                                                                                                           checkBolusAtNextStatus = true
-                                                                                                                       }
-                                                                                                                       MedLinkStandardReturn(f.answer, f.functionResult.answer)
-                                                                                                                   })
+            val bolusCallback = BolusCallback(aapsLogger, detailedBolusInfo)
+            val andThem: Function<Supplier<Stream<String>>, MedLinkStandardReturn<String>> = bolusCallback.andThen { f: MedLinkStandardReturn<BolusAnswer> ->
+                val answer = f.functionResult
+                if (answer.response == PumpResponses.UnknownAnswer) {
+                    aapsLogger.info(LTag.PUMPBTCOMM, "need to check bolus")
+                    //                    processDeliveredBolus(answer, detailedBolusInfo);
+                    bolusHistoryCheck = true
+                }
+                MedLinkStandardReturn(f.answer, f.functionResult.answer)
+            }
             val bolusCommand = if (detailedBolusInfo.bolusType == DetailedBolusInfo.BolusType.TBR) MedLinkCommandType.TBRBolus
             else if (detailedBolusInfo.bolusType == DetailedBolusInfo.BolusType.SMB) MedLinkCommandType.SMBBolus else
                 MedLinkCommandType
@@ -2757,22 +2787,21 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                                           andThem, buildBolusStatusMessage(detailedBolusInfo.copy()),
                                           btSleepTime,
                                           BleBolusCommand(aapsLogger, medLinkService!!.medLinkServiceData, this),
-                                          tempBasalMicrobolusOperations != null &&
-                                              (tempBasalMicrobolusOperations!!.shouldBeSuspended() ||
-                                                  tempBasalMicrobolusOperations!!.operations.stream().findFirst()
-                                                      .map { f: TempBasalMicroBolusPair -> f.operationType == TempBasalMicroBolusPair.OperationType.REACTIVATE }
-                                                      .orElse(false)
-                                                  || tempBasalMicrobolusOperations!!.absoluteRate == 0.0)
+                                          (tempBasalMicrobolusOperations.shouldBeSuspended() ||
+                                              tempBasalMicrobolusOperations.operations.stream().findFirst()
+                                                  .map { f: TempBasalMicroBolusPair -> f.operationType == TempBasalMicroBolusPair.OperationType.REACTIVATE }
+                                                  .orElse(false)
+                                              || tempBasalMicrobolusOperations.absoluteRate == 0.0)
             )
             medLinkService!!.medtronicUIComm?.executeCommandCP(MedLinkPumpMessage<PumpDriverState, Any>(buildStartStopCommands(), btSleepTime), msg)
             setRefreshButtonEnabled(true)
 
-//            int count = 0;
-//            while ((!isPumpNotReachable() || bolusTimesstamp == 0l) && count < 15) {
-//                SystemClock.sleep(5000);
-//                count++;
-//            }
-//            // LOG.debug("MedtronicPumpPlugin::deliverBolus - Response: {}", response);
+            //            int count = 0;
+            //            while ((!isPumpNotReachable() || bolusTimesstamp == 0l) && count < 15) {
+            //                SystemClock.sleep(5000);
+            //                count++;
+            //            }
+            //            // LOG.debug("MedtronicPumpPlugin::deliverBolus - Response: {}", response);
             if (response.get() && !isPumpNotReachable) {
                 if (bolusDeliveryType == MedtronicPumpPluginInterface.BolusDeliveryType.CancelDelivery) {
                     // LOG.debug("MedtronicPumpPlugin::deliverBolus - Delivery Canceled after Bolus started.");
@@ -2794,10 +2823,10 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                 val now = System.currentTimeMillis()
                 detailedBolusInfo.deliverAtTheLatest = now
 
-//                activePlugin.getActiveTreatments().addToHistoryTreatment(detailedBolusInfo, true);
+                //                activePlugin.getActiveTreatments().addToHistoryTreatment(detailedBolusInfo, true);
 
                 // we subtract insulin, exact amount will be visible with next remainingInsulin update.
-                medLinkPumpStatus.reservoirLevel -= detailedBolusInfo.insulin
+                medLinkPumpStatus.reservoirRemainingUnits -= detailedBolusInfo.insulin
                 incrementStatistics(if (detailedBolusInfo.bolusType == DetailedBolusInfo.BolusType.SMB) MedtronicConst.Statistics.SMBBoluses else MedtronicConst.Statistics.StandardBoluses)
 
                 // calculate time for bolus and set driver to busy for that time
@@ -2810,6 +2839,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                     .bolusDelivered(detailedBolusInfo.insulin) //
                     .carbsDelivered(detailedBolusInfo.carbs)
             } else {
+                aapsLogger.info(LTag.PUMPBTCOMM, "bolus not delivered")
                 PumpEnactResult(injector) //
                     .success(bolusDeliveryType == MedtronicPumpPluginInterface.BolusDeliveryType.CancelDelivery) //
                     .enacted(false) //
@@ -2828,13 +2858,13 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         aapsLogger.info(LTag.DATABASE, currentPumpStatus.toString())
         val commands: MutableList<CommandStructure<PumpDriverState, BleCommand>> = ArrayList()
         val callback: Function1<PumpEnactResult, *> = { o: Any? -> null }
-        val oper = if (tempBasalMicrobolusOperations!!.operations.isNotEmpty()) {
-            tempBasalMicrobolusOperations!!.operations.first
+        val oper = if (tempBasalMicrobolusOperations.operations.isNotEmpty()) {
+            tempBasalMicrobolusOperations.operations.first
         } else {
             null
         }
 
-        if (currentPumpStatus === PumpStatusType.Suspended || tempBasalMicrobolusOperations!!.shouldBeSuspended()) {
+        if (currentPumpStatus === PumpRunningState.Suspended || tempBasalMicrobolusOperations.shouldBeSuspended()) {
             commands.addAll(
                 buildChangeStatusFunction(
                     oper,
@@ -2843,7 +2873,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
 
             )
         }
-        if (tempBasalMicrobolusOperations!!.shouldBeSuspended() && temporaryBasal != null && temporaryBasal?.rate!! < 100) {
+        if (tempBasalMicrobolusOperations.shouldBeSuspended() && temporaryBasal != null && temporaryBasal?.rate!! < 100) {
             commands.addAll(
                 buildChangeStatusFunction(
                     oper,
@@ -2856,106 +2886,83 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     }
 
     private val currentPumpStatus: Any
-        get() = if (tempBasalMicrobolusOperations != null &&
-            !tempBasalMicrobolusOperations!!.operations.isEmpty()
+        get() = if (!tempBasalMicrobolusOperations.operations.isEmpty()
         ) {
-            val firstOperation = tempBasalMicrobolusOperations!!.operations.first
+            val firstOperation = tempBasalMicrobolusOperations.operations.first
             if (firstOperation.operationType == TempBasalMicroBolusPair.OperationType.BOLUS ||
                 firstOperation.operationType == TempBasalMicroBolusPair.OperationType.SUSPEND
             ) {
-                PumpStatusType.Running
+                PumpRunningState.Running
             } else {
-                PumpStatusType.Suspended
+                PumpRunningState.Suspended
             }
         } else {
-            PumpStatusType.Running
+            PumpRunningState.Running
         }
 
-    private fun processDeliveredBolus(answer: BolusAnswer, detailedBolusInfo: DetailedBolusInfo) {
-        detailedBolusInfo.insulin = answer.bolusAmount
-        detailedBolusInfo.deliverAtTheLatest = answer.bolusDeliveryTime.toInstant().toEpochMilli()
-        handleNewTreatmentData(of(JSONObject(detailedBolusInfo.toJsonString())))
+    private fun processDeliveredBolus(answer: BolusAnswer) {
+        handleNewTreatmentData(of(JSONObject(answer.detailedBolusInfo.toJsonString())))
         // pumpSyncStorage.addBolusWithTempId(detailedBolusInfo, true, this)
-        lastBolusTime = detailedBolusInfo.deliverAtTheLatest
-        lastDeliveredBolus = detailedBolusInfo.insulin
         lastDetailedBolusInfo = null
-        handleBolusDelivered(detailedBolusInfo)
-        //        if (answer.get().anyMatch(ans -> ans.trim().contains("recent bolus bl"))) {
-//            answer.get().filter(ans -> ans.trim().contains("recent bolus bl")).forEach(
-//                    bolusStr -> {
-//                        Pattern bolusPattern = Pattern.compile("d{1,2}.d{1,2}");
-//                        Matcher matcher = bolusPattern.matcher(bolusStr);
-//                        if (matcher.find() &&
-//                                detailedBolusInfo.insulin == Double.parseDouble(matcher.group(0))) {
-//                            lastDeliveredBolus = detailedBolusInfo.insulin;
-//                            lastDetailedBolusInfo = detailedBolusInfo;
-//                        }
-//                        Pattern datePattern = Pattern.compile("d{1,2}:d{2}");
-//                        Matcher dateMatcher = datePattern.matcher(bolusStr);
-//                        if (dateMatcher.find()) {
-//                            String date = dateMatcher.group(0);
-//                        }
-//
-//                    });
-//        }
+        handleBolusDelivered(answer.detailedBolusInfo)
     }
 
-//     private fun bolusInProgress(detailedBolusInfo: DetailedBolusInfo, actionTime: Long) {
-//         aapsLogger.info(LTag.EVENTS, "bolus in progress")
-//         val t = Treatment()
-//         t.isSMB = detailedBolusInfo.bolusType == DetailedBolusInfo.BolusType.SMB
-//         t.isTBR = detailedBolusInfo.bolusType == DetailedBolusInfo.BolusType.TBR
-//         val bolusEvent = EventOverviewBolusProgress
-//         bolusEvent.t = t
-//         bolusEvent.status = rh.gs(R.string.bolusdelivering, 0.0, detailedBolusInfo.insulin)
-//         bolusEvent.percent = 0
-//         rxBus.send(bolusEvent)
-//
-// //        Function<Supplier<Stream<String>>, MedLinkStandardReturn> function = new BolusHistoryCallback();
-// //        MedLinkPumpMessage msg = new BolusStatusMedLinkMessage(
-// //                MedLinkCommandType.StopStartPump,function, medLinkServiceData,
-// //                getAapsLogger(), bolusingEvent);
-// //        medLinkService.getMedtronicUIComm().executeCommandCP(msg);
-//         val bolusTime = (detailedBolusInfo.insulin * 42.0).toInt()
-//         val bolusEndTime = actionTime + bolusTime * 1000L
-//         val bolusDelta = System.currentTimeMillis() - actionTime
-//         //        Thread bolusEventThread = new Thread() {
-// //            @Override public void run() {
-// //                super.run();
-//         while (bolusEndTime > System.currentTimeMillis() + 100) {
-//             val remaining = (bolusEndTime - System.currentTimeMillis()) / bolusDelta
-//             val bolusEvt = EventOverviewBolusProgress
-//             bolusEvt.t = t
-//             bolusEvt.percent = remaining.toInt()
-//             bolusEvt.status = rh.gs(R.string.medlink_delivered, remaining * detailedBolusInfo.insulin, detailedBolusInfo.insulin)
-//             rxBus.send(bolusEvt)
-//         }
-//         val bolusEvt = EventOverviewBolusProgress
-//         bolusEvt.percent = 100
-//         bolusEvt.status = rh.gs(R.string.medlink_delivered, detailedBolusInfo.insulin, detailedBolusInfo.insulin)
-//         rxBus.send(bolusEvt)
-//         SystemClock.sleep(200)
-//         scheduleNextRefresh(MedLinkMedtronicStatusRefreshType.PumpHistory, -5)
-//         //                getRxBus().send(new EventDismissBolusProgressIfRunning(new PumpEnactResult(getInjector()).
-// //                        success(true).enacted(true).bolusDelivered(detailedBolusInfo.insulin) //
-// //                        .carbsDelivered(detailedBolusInfo.carbs)));
-// //                getRxBus().send(new ());
-// //                getRxBus().send(new EventDismissBolusProgressIfRunning());
-// //            }
-// //        };
-// //        bolusEventThread.start();
-//     }
+    //     private fun bolusInProgress(detailedBolusInfo: DetailedBolusInfo, actionTime: Long) {
+    //         aapsLogger.info(LTag.EVENTS, "bolus in progress")
+    //         val t = Treatment()
+    //         t.isSMB = detailedBolusInfo.bolusType == DetailedBolusInfo.BolusType.SMB
+    //         t.isTBR = detailedBolusInfo.bolusType == DetailedBolusInfo.BolusType.TBR
+    //         val bolusEvent = EventOverviewBolusProgress
+    //         bolusEvent.t = t
+    //         bolusEvent.status = rh.gs(R.string.bolusdelivering, 0.0, detailedBolusInfo.insulin)
+    //         bolusEvent.percent = 0
+    //         rxBus.send(bolusEvent)
+    //
+    // //        Function<Supplier<Stream<String>>, MedLinkStandardReturn> function = new BolusHistoryCallback();
+    // //        MedLinkPumpMessage msg = new BolusStatusMedLinkMessage(
+    // //                MedLinkCommandType.StopStartPump,function, medLinkServiceData,
+    // //                getAapsLogger(), bolusingEvent);
+    // //        medLinkService.getMedtronicUIComm().executeCommandCP(msg);
+    //         val bolusTime = (detailedBolusInfo.insulin * 42.0).toInt()
+    //         val bolusEndTime = actionTime + bolusTime * 1000L
+    //         val bolusDelta = System.currentTimeMillis() - actionTime
+    //         //        Thread bolusEventThread = new Thread() {
+    // //            @Override public void run() {
+    // //                super.run();
+    //         while (bolusEndTime > System.currentTimeMillis() + 100) {
+    //             val remaining = (bolusEndTime - System.currentTimeMillis()) / bolusDelta
+    //             val bolusEvt = EventOverviewBolusProgress
+    //             bolusEvt.t = t
+    //             bolusEvt.percent = remaining.toInt()
+    //             bolusEvt.status = rh.gs(R.string.medlink_delivered, remaining * detailedBolusInfo.insulin, detailedBolusInfo.insulin)
+    //             rxBus.send(bolusEvt)
+    //         }
+    //         val bolusEvt = EventOverviewBolusProgress
+    //         bolusEvt.percent = 100
+    //         bolusEvt.status = rh.gs(R.string.medlink_delivered, detailedBolusInfo.insulin, detailedBolusInfo.insulin)
+    //         rxBus.send(bolusEvt)
+    //         SystemClock.sleep(200)
+    //         scheduleNextRefresh(MedLinkMedtronicStatusRefreshType.PumpHistory, -5)
+    //         //                getRxBus().send(new EventDismissBolusProgressIfRunning(new PumpEnactResult(getInjector()).
+    // //                        success(true).enacted(true).bolusDelivered(detailedBolusInfo.insulin) //
+    // //                        .carbsDelivered(detailedBolusInfo.carbs)));
+    // //                getRxBus().send(new ());
+    // //                getRxBus().send(new EventDismissBolusProgressIfRunning());
+    // //            }
+    // //        };
+    // //        bolusEventThread.start();
+    //     }
 
     override fun deliverBolus(
         detailedBolusInfo: DetailedBolusInfo,
-        func: (PumpEnactResult) -> Unit
+        func: (PumpEnactResult) -> Unit,
     ) {
         val bolus = detailedBolusInfo.copy()
         aapsLogger.info(LTag.PUMP, "MedtronicPumpPlugin::deliverBolus - " + MedtronicPumpPluginInterface.BolusDeliveryType.DeliveryPrepared)
         aapsLogger.info(LTag.PUMP, detailedBolusInfo.toJsonString())
 
         setRefreshButtonEnabled(false)
-        if (detailedBolusInfo.insulin > medLinkPumpStatus.reservoirLevel) {
+        if (detailedBolusInfo.insulin > medLinkPumpStatus.reservoirRemainingUnits) {
             func.invoke(
                 PumpEnactResult(injector) //
                     .success(false) //
@@ -2963,7 +2970,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                     .comment(
                         rh.gs(
                             string.medtronic_cmd_bolus_could_not_be_delivered_no_insulin,
-                            medLinkPumpStatus.reservoirLevel,
+                            medLinkPumpStatus.reservoirRemainingUnits,
                             bolus.insulin
                         )
                     )
@@ -2980,30 +2987,34 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
             // LOG.debug("MedtronicPumpPlugin::deliverBolus - Delivery Canceled.");
             func.invoke(setNotReachable(true, true))
         }
-        // LOG.debug("MedtronicPumpPlugin::deliverBolus - Starting wait period.");
-        // val sleepTime = sp.getInt(MedtronicConst.Prefs.BolusDelay, 10) * 1000
-        //        SystemClock.sleep(sleepTime);
-        if (bolusDeliveryType == MedtronicPumpPluginInterface.BolusDeliveryType.CancelDelivery) {
-            // LOG.debug("MedtronicPumpPlugin::deliverBolus - Delivery Canceled, before wait period.");
-            func.invoke(setNotReachable(true, true))
-        }
-        // LOG.debug("MedtronicPumpPlugin::deliverBolus - End wait period. Start delivery");
+
         try {
             bolusDeliveryType = MedtronicPumpPluginInterface.BolusDeliveryType.Delivering
-            // LOG.debug("MedtronicPumpPlugin::deliverBolus - Start delivery");
-            // val response = AtomicReference(false)
-//            if (lastDetailedBolusInfo != null) {
-//                readBolusData(lastDetailedBolusInfo!!)
-//            }
+
+            val resultFunc = { f: MedLinkStandardReturn<BolusAnswer> ->
+
+                func.invoke(
+                    PumpEnactResult(injector) //
+                        .success(bolusDeliveryType == MedtronicPumpPluginInterface.BolusDeliveryType.CancelDelivery) //
+                        .enacted(false) //
+                        .comment(rh.gs(string.medtronic_cmd_bolus_could_not_be_delivered))
+                )
+                val i = Intent(context, ErrorHelperActivity::class.java)
+                i.putExtra("soundid", R.raw.boluserror)
+                i.putExtra("status", f.answer.get().collect(Collectors.joining()))
+                i.putExtra("title", rh.gs(string.medtronic_cmd_bolus_could_not_be_delivered))
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(i)
+
+            }
             val bolusCallback = BolusCallback(aapsLogger, bolus)
             val andThen: Function<Supplier<Stream<String>>, MedLinkStandardReturn<String>> = bolusCallback.andThen { f: MedLinkStandardReturn<BolusAnswer> ->
                 // val answer = Supplier { f.answer }
                 aapsLogger.info(LTag.PUMPBTCOMM, f.functionResult.response.name)
                 if (PumpResponses.BolusDelivered == f.functionResult.response) {
+                    bolusHistoryCheck = false
                     bolusDeliveryType = MedtronicPumpPluginInterface.BolusDeliveryType.Idle
-                    bolus.timestamp = f.functionResult.bolusDeliveryTime.toInstant().toEpochMilli()
-                    processDeliveredBolus(f.functionResult, bolus)
-                    //                    bolusInProgress(detailedBolusInfo, bolusDeliveryTime);
+                    processDeliveredBolus(f.functionResult)
                     func.invoke(
                         PumpEnactResult(injector).success(true) //
                             .enacted(true) //
@@ -3012,59 +3023,34 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                     )
                 } else if (PumpResponses.UnknownAnswer == f.functionResult.response) {
                     val bolusAnswer = f.functionResult
-                    if (bolus.insulin == bolusAnswer.bolusAmount && bolusAnswer.bolusDeliveryTime.toInstant().toEpochMilli() >
-                        lastBolusTime && bolusAnswer.bolusDeliveryTime.toInstant().toEpochMilli() -
-                        lastBolusTime <= 180000
-                    ) {
-                        bolus.timestamp = bolusAnswer.bolusDeliveryTime.toInstant().toEpochMilli()
-                        bolus.insulin = bolusAnswer.bolusAmount
-                        bolus.bolusTimestamp = bolusAnswer.bolusDeliveryTime.toInstant().toEpochMilli()
-//                        handleNewTreatmentData(Stream.of(JSONObject(detailedBolusInfo.toJsonString())))
+                    bolusHistoryCheck = true
+                    if (bolusAnswer.delivered == bolus.insulin) {
+                        handleNewTreatmentData(of(JSONObject(bolusAnswer.detailedBolusInfo.toJsonString())))
                     } else {
                         //TODO postpone this message to later,  call status logic before to guarantee that the bolus has not been delivered
                         aapsLogger.info(LTag.PUMPBTCOMM, "pump is not deliverying")
-                        if (f.functionResult.bolusDeliveryTime != null) {
-                            processDeliveredBolus(f.functionResult, detailedBolusInfo)
-                            func.invoke(
-                                PumpEnactResult(injector) //
-                                    .success(bolusDeliveryType == MedtronicPumpPluginInterface.BolusDeliveryType.CancelDelivery) //
-                                    .enacted(false) //
-                                    .comment(rh.gs(string.medtronic_cmd_bolus_could_not_be_delivered))
-                            )
-                            val i = Intent(context, ErrorHelperActivity::class.java)
-                            i.putExtra("soundid", R.raw.boluserror)
-                            i.putExtra("status", f.answer.get().collect(Collectors.joining()))
-                            i.putExtra("title", rh.gs(string.medtronic_cmd_bolus_could_not_be_delivered))
-                            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            context.startActivity(i)
+                        if (f.functionResult.delivered > 0.0) {
+                            processDeliveredBolus(f.functionResult)
                         } else {
+
                             readBolusData(detailedBolusInfo)
                         }
                     }
                 } else if (PumpResponses.DeliveringBolus == f.functionResult.response) {
+                    bolusHistoryCheck = true
                     lastDetailedBolusInfo = bolus
-                    lastBolusTime = pumpStatusData.lastDataTime
                     aapsLogger.info(LTag.PUMPBTCOMM, "and themmmm")
                 }
-//                val recentBolus = Supplier { answer.get().filter { ans: String -> ans.contains("recent bolus") } }
-//                if (recentBolus.get().findFirst().isPresent) {
-//                    val result = recentBolus.get().findFirst().get()
-//                    aapsLogger.info(LTag.PUMPBTCOMM, result)
-//                    val pattern = Pattern.compile("d{1,2}.d{1,2}")
-//                    val matcher = pattern.matcher(result)
-//                    if (matcher.find()) {
-//                        detailedBolusInfo.insulin = matcher.group(0).toDouble()
-//                    }
-//                }
-                if(f.functionResult !=null && f.functionResult.answer !=null) {
+                if (f.functionResult.answer != null) {
                     MedLinkStandardReturn(f.answer, f.functionResult.answer)
                 } else {
                     MedLinkStandardReturn(f.answer, "") //TODO check why is happening a nullpointer here
                 }
             }
-            if (pumpStatusData.pumpStatusType == PumpStatusType.Suspended &&
+            if (pumpStatusData.pumpRunningState == PumpRunningState.Suspended &&
                 bolus.insulin > 0.0
             ) {
+                aapsLogger.info(LTag.EVENTS, "bolus starting pump")
                 startPump(object : Callback() {
                     override fun run() {
                         aapsLogger.info(LTag.EVENTS, "starting pump for bolus")
@@ -3082,13 +3068,11 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                                           andThen, bolusStatusMessage,
                                           btSleepTime,
                                           BleBolusCommand(aapsLogger, medLinkService!!.medLinkServiceData, this),
-
-                                          tempBasalMicrobolusOperations != null &&
-                                              (tempBasalMicrobolusOperations!!.shouldBeSuspended() ||
-                                                  tempBasalMicrobolusOperations!!.operations.stream().findFirst()
-                                                      .map { f: TempBasalMicroBolusPair -> f.operationType == TempBasalMicroBolusPair.OperationType.REACTIVATE }
-                                                      .orElse(false)
-                                                  || tempBasalMicrobolusOperations!!.absoluteRate == 0.0)
+                                          (tempBasalMicrobolusOperations.shouldBeSuspended() ||
+                                              tempBasalMicrobolusOperations.operations.stream().findFirst()
+                                                  .map { f: TempBasalMicroBolusPair -> f.operationType == TempBasalMicroBolusPair.OperationType.REACTIVATE }
+                                                  .orElse(false)
+                                              || tempBasalMicrobolusOperations.absoluteRate == 0.0)
             )
             val startStopMsg = buildStartStopCommands()
             if (startStopMsg.isNotEmpty()) {
@@ -3098,11 +3082,11 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
             }
             setRefreshButtonEnabled(true)
 
-//            int count = 0;
-//            while ((!isPumpNotReachable() || bolusTimesstamp == 0l) && count < 15) {
-//                SystemClock.sleep(5000);
-//                count++;
-//            }
+            //            int count = 0;
+            //            while ((!isPumpNotReachable() || bolusTimesstamp == 0l) && count < 15) {
+            //                SystemClock.sleep(5000);
+            //                count++;
+            //            }
             // LOG.debug("MedtronicPumpPlugin::deliverBolus - Response: {}", response);
             if (!isPumpNotReachable) {
                 if (bolusDeliveryType == MedtronicPumpPluginInterface.BolusDeliveryType.CancelDelivery) {
@@ -3126,10 +3110,10 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                 bolus.deliverAtTheLatest = now
                 // detailedBolusInfo.deliverAt = now // not sure about that one
 
-//                activePlugin.getActiveTreatments().addToHistoryTreatment(detailedBolusInfo, true);
+                //                activePlugin.getActiveTreatments().addToHistoryTreatment(detailedBolusInfo, true);
 
                 // we subtract insulin, exact amount will be visible with next remainingInsulin update.
-                medLinkPumpStatus.reservoirLevel -= bolus.insulin
+                medLinkPumpStatus.reservoirRemainingUnits -= bolus.insulin
                 incrementStatistics(if (bolus.bolusType == DetailedBolusInfo.BolusType.SMB) MedtronicConst.Statistics.SMBBoluses else MedtronicConst.Statistics.StandardBoluses)
 
                 // calculate time for bolus and set driver to busy for that time
@@ -3189,9 +3173,9 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         return RileyLinkPumpInfo(frequency, model, serialNumber)
     }
 
-// override fun getLastConnectionTimeMillis(): Long {
-//     return pumpStatusData.lastConnection
-// }
+    // override fun getLastConnectionTimeMillis(): Long {
+    //     return pumpStatusData.lastConnection
+    // }
 
     override fun setLastCommunicationToNow() {
         medLinkPumpStatus.setLastCommunicationToNow()
@@ -3202,36 +3186,36 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         isRefresh = true
     }
 
-// private fun buildIntentSensValues(vararg bgs: InMemoryGlucoseValue): Intent {
-//     val intent = Intent()
-//     intent.putExtra("sensorType", "Enlite")
-//     val glucoseValues = Bundle()
-//     val fingerValues = Bundle()
-//     var gvPosition = 0
-//     var meterPosition = 0
-//     for (bg in bgs) {
-//         if (bg ==GlucoseValue.SourceSensor.UNKNOW) {
-//             aapsLogger.info(LTag.BGSOURCE, "User bg source")
-//             val bgBundle = Bundle()
-//             bgBundle.putDouble("meterValue", bg.value)
-//             bgBundle.putLong("timestamp", bg.timestamp)
-//             fingerValues.putBundle("" + meterPosition, bgBundle)
-//             meterPosition++
-//         } else {
-//             val bgBundle = Bundle()
-//             bgBundle.putDouble("value", bg.value)
-//             bgBundle.putLong("date", bg.timestamp)
-//             bgBundle.putString("direction", bg.get)
-//             //            bgBundle.putString("raw", bg.raw);
-//             glucoseValues.putBundle("" + gvPosition, bgBundle)
-//             gvPosition++
-//         }
-//     }
-//     intent.putExtra("glucoseValues", glucoseValues)
-//     intent.putExtra("meters", fingerValues)
-//     intent.putExtra("isigValues", Bundle())
-//     return intent
-// }
+    // private fun buildIntentSensValues(vararg bgs: InMemoryGlucoseValue): Intent {
+    //     val intent = Intent()
+    //     intent.putExtra("sensorType", "Enlite")
+    //     val glucoseValues = Bundle()
+    //     val fingerValues = Bundle()
+    //     var gvPosition = 0
+    //     var meterPosition = 0
+    //     for (bg in bgs) {
+    //         if (bg ==GlucoseValue.SourceSensor.UNKNOW) {
+    //             aapsLogger.info(LTag.BGSOURCE, "User bg source")
+    //             val bgBundle = Bundle()
+    //             bgBundle.putDouble("meterValue", bg.value)
+    //             bgBundle.putLong("timestamp", bg.timestamp)
+    //             fingerValues.putBundle("" + meterPosition, bgBundle)
+    //             meterPosition++
+    //         } else {
+    //             val bgBundle = Bundle()
+    //             bgBundle.putDouble("value", bg.value)
+    //             bgBundle.putLong("date", bg.timestamp)
+    //             bgBundle.putString("direction", bg.get)
+    //             //            bgBundle.putString("raw", bg.raw);
+    //             glucoseValues.putBundle("" + gvPosition, bgBundle)
+    //             gvPosition++
+    //         }
+    //     }
+    //     intent.putExtra("glucoseValues", glucoseValues)
+    //     intent.putExtra("meters", fingerValues)
+    //     intent.putExtra("isigValues", Bundle())
+    //     return intent
+    // }
 
     private fun buildIntentSensValues(vararg sensorDataReadings: BgSync.BgHistory): Bundle {
         val baseBundle = Bundle()
@@ -3281,24 +3265,24 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     }
 
     //    private Bundle buildIntentSensValues(SensorDataReading... sens) {
-//        Bundle isigValues = new Bundle();
-//
-//        int gvPosition = 0;
-//        int meterPosition = 0;
-//        for (SensorDataReading bg : sens) {
-//            Bundle bgBundle = new Bundle();
-//            bgBundle.putDouble("value", bg.value);
-//            bgBundle.putLong("date", bg.date);
-//            bgBundle.putString("direction", bg.direction);
-//            bgBundle.putDouble("calibrationFactor", bg.calibrationFactor);
-//            bgBundle.putInt("sensorUptime", bg.sensorUptime);
-//            bgBundle.putDouble("isig", bg.isig);
-//            bgBundle.putDouble("delta", bg.deltaSinceLastBG);
-//            isigValues.putBundle("" + gvPosition, bgBundle);
-//            gvPosition++;
-//        }
-//        return isigValues;
-//    }
+    //        Bundle isigValues = new Bundle();
+    //
+    //        int gvPosition = 0;
+    //        int meterPosition = 0;
+    //        for (SensorDataReading bg : sens) {
+    //            Bundle bgBundle = new Bundle();
+    //            bgBundle.putDouble("value", bg.value);
+    //            bgBundle.putLong("date", bg.date);
+    //            bgBundle.putString("direction", bg.direction);
+    //            bgBundle.putDouble("calibrationFactor", bg.calibrationFactor);
+    //            bgBundle.putInt("sensorUptime", bg.sensorUptime);
+    //            bgBundle.putDouble("isig", bg.isig);
+    //            bgBundle.putDouble("delta", bg.deltaSinceLastBG);
+    //            isigValues.putBundle("" + gvPosition, bgBundle);
+    //            gvPosition++;
+    //        }
+    //        return isigValues;
+    //    }
     fun handleNewCareportalEvent(events: Supplier<Stream<JSONObject>>) {
         events.get().forEach { e: JSONObject? ->
             pumpSync.insertTherapyEventIfNewWithTimestamp(
@@ -3311,134 +3295,85 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     }
 
     override fun handleNewTreatmentData(bolusInfo: Stream<JSONObject>) {
+        bolusHistoryCheck = false
+        var lastProcessedBolusTimestamp = 0L
+        var minBolusTimestamp = 0L
+        val state = pumpSync.expectedPumpState()
+        var count=0
         bolusInfo.forEachOrdered { bolusJson: JSONObject ->
+            count+=1
             val bInfo = DetailedBolusInfo.fromJsonString(bolusJson.toString())
             aapsLogger.info(LTag.PUMPBTCOMM, lastDetailedBolusInfo?.toJsonString() ?: "")
             aapsLogger.info(LTag.PUMPBTCOMM, bInfo.toJsonString())
+            if (minBolusTimestamp < (bInfo.bolusTimestamp ?: bInfo.timestamp)) {
+                minBolusTimestamp = bInfo.bolusTimestamp ?: bInfo.timestamp
+            }
             if (lastDetailedBolusInfo != null && bInfo.insulin == lastDetailedBolusInfo!!.insulin) {
-                if (lastDetailedBolusInfo!!.carbs != 0.0) {
-                    bInfo.carbs = lastDetailedBolusInfo!!.carbs
-                }
-                if (lastDetailedBolusInfo?.bolusType != DetailedBolusInfo.BolusType.NORMAL) {
+                if (bInfo.bolusType == DetailedBolusInfo.BolusType.NORMAL && lastDetailedBolusInfo?.bolusType != DetailedBolusInfo.BolusType.NORMAL) {
                     bInfo.bolusType = lastDetailedBolusInfo!!.bolusType
                 }
                 lastDetailedBolusInfo = null
             }
-
-            val mod = bInfo.timestamp % 60000
-
-            if (bInfo.insulin > 0) {
+            var mod = (bInfo.bolusTimestamp ?: bInfo.timestamp).mod(60000)
+            if (lastProcessedBolusTimestamp == 0L && state.bolus != null && state.bolus?.timestamp == bInfo.bolusTimestamp) {
+                remainingBolus = bInfo
+                readBolusHistory()
+            } else if (bInfo.carbs != 0.0) {
+                pumpSyncStorage.addBolusWithTempId(bInfo, true, this)
+            } else if (bInfo.insulin > 0) {
+                if (mod != 0 && lastProcessedBolusTimestamp == (bInfo.bolusTimestamp?.minus(mod) ?: bInfo.timestamp.mod(mod))) {
+                    mod -= 30000
+                    if (::remainingBolus.isInitialized && remainingBolus.bolusTimestamp == bInfo.bolusTimestamp?.minus(mod) && bInfo.insulin == remainingBolus.insulin) {
+                        bInfo.bolusType = remainingBolus.bolusType
+                        remainingBolus = DetailedBolusInfo()
+                    }
+                }
+                lastProcessedBolusTimestamp = bInfo.bolusTimestamp?.minus(mod) ?: bInfo.timestamp
                 pumpSyncStorage.pumpSync.syncBolusWithTempId(
-                    bInfo.timestamp - mod, bInfo.insulin,
-                    generateTempId(bInfo.timestamp - mod),
+                    lastProcessedBolusTimestamp, bInfo.insulin,
+                    generateTempId(bInfo.timestamp),
                     bInfo.bolusType, bInfo.bolusPumpId,
                     this.pumpType, serialNumber()
                 )
             }
-            // pumpSyncStorage.addBolusWithTempId(bInfo, true, this)
         }
+        if (state.bolus != null && minBolusTimestamp > state.bolus?.timestamp!! && count>1 ) {
+            aapsLogger.info(LTag.PUMPBTCOMM, "previous read?")
+            aapsLogger.info(LTag.PUMPBTCOMM, "" + state.bolus?.timestamp)
+            aapsLogger.info(LTag.PUMPBTCOMM, "" + minBolusTimestamp)
+            readBolusHistory(true)
+        }
+    }
+
+    override fun getBatteryType(): String {
+        return medLinkPumpStatus.batteryType.toString()
     }
 
     private fun handleNewEvent() {
+        medtronicUtil.dismissNotification(MedtronicNotificationType.PumpUnreachable, rxBus)
         aapsLogger.info(LTag.EVENTS, " new event ")
         aapsLogger.info(LTag.EVENTS, "" + isInitialized)
-        aapsLogger.info(LTag.EVENTS, "" + lastBolusTime)
         aapsLogger.info(LTag.EVENTS, "" + (medLinkPumpStatus.lastBolusTime?.time ?: ""))
         aapsLogger.info(LTag.EVENTS, "" + pumpTimeDelta)
+        // val pumpState = pumpSyncStorage.pumpSync.expectedPumpState()
+
         if (isInitialized && medLinkPumpStatus.lastBolusTime != null) {
-            if (lastBolusTime != medLinkPumpStatus.lastBolusTime!!.time && lastDeliveredBolus == medLinkPumpStatus.lastBolusAmount && Math.abs(lastBolusTime - medLinkPumpStatus.lastBolusTime!!.time) >
-                pumpTimeDelta + 60000
-            ) {
-                aapsLogger.info(LTag.PUMPBTCOMM, "read bolus history")
-                readBolusHistory()
-            } else if (lastBolusTime > 0 && lastDetailedBolusInfo != null) {
-                lastBolusTime = lastDetailedBolusInfo!!.deliverAtTheLatest
-                if (sp.getBoolean(string.medlink_key_force_bolus_history_read, false) ||
-                    pumpStatusData.lastBolusAmount != lastDetailedBolusInfo!!.insulin
-                ) {
-                    aapsLogger.info(LTag.PUMPBTCOMM, "read bolus history")
-                    readBolusHistory()
-                } else {
-                    lastDetailedBolusInfo!!.deliverAtTheLatest = pumpStatusData.lastBolusTime!!.time
-                    lastDetailedBolusInfo!!.bolusTimestamp = pumpStatusData.lastBolusTime!!.time
-                    handleNewTreatmentData(of(JSONObject(lastDetailedBolusInfo!!.toJsonString())))
-                    // pumpSyncStorage.addBolusWithTempId(lastDetailedBolusInfo!!, true, this)
-                    lastDetailedBolusInfo = null
-                }
-            } else if (lastBolusTime < pumpStatusData.lastBolusTime!!.time) {
-                aapsLogger.info(LTag.PUMPBTCOMM, "read bolus history")
-                readBolusHistory()
-            }
-        } else {
-            lastBolusTime = medLinkPumpStatus.lastBolusTime?.time ?: 0L
-        }
-    }
+            //TODO possible removal of this first sentence
+            // if (pumpState.bolus?.timestamp != medLinkPumpStatus.lastBolusTime?.time
+            //     || sp.getBoolean(string.medlink_key_force_bolus_history_read, false) || bolusHistoryCheck
+            // ) {
+            //     aapsLogger.info(LTag.PUMPBTCOMM, "read bolus history")
+            //     readBolusHistory()
+            // }
+            if (lastDetailedBolusInfo != null) {
+                aapsLogger.info(LTag.PUMPBTCOMM, "lastdetailedbolusinfo")
+                lastDetailedBolusInfo!!.deliverAtTheLatest = pumpStatusData.lastBolusTime!!.time
+                lastDetailedBolusInfo!!.bolusTimestamp = pumpStatusData.lastBolusTime!!.time
+                handleNewTreatmentData(of(JSONObject(lastDetailedBolusInfo!!.toJsonString())))
+                lastDetailedBolusInfo = null
 
-    fun handleNewBgData(sensorDataReadings: BgSync.BgHistory) {
-        if (lastStatus !== medLinkPumpStatus.pumpStatusType.status) {
-            if (medLinkPumpStatus.pumpStatusType === PumpStatusType.Suspended &&
-                (PumpStatusType.Running.status == lastStatus ||
-                    !isInitialized)
-            ) {
-                createTemporaryBasalData(30, 0.0)
-            } else if (medLinkPumpStatus.pumpStatusType == PumpStatusType.Running &&
-                (PumpStatusType.Suspended.status == lastStatus ||
-                    !isInitialized)
-            ) {
-                cancelTempBasal(
-                    false, null
-                )
             }
         }
-        if (sensorDataReadings.bgValue.size == 1) {
-            val searchEntry = PumpHistoryEntry()
-            searchEntry.setEntryType(
-                MedtronicDeviceType.Medtronic_515,
-                PumpHistoryEntryType.BGReceived, TODO("Could not convert int literal '0B' to Kotlin")
-            )
-            searchEntry.displayableValue = sensorDataReadings.bgValue.first().toString()
-            val historyResult = PumpHistoryResult(
-                aapsLogger, searchEntry,
-                sensorDataReadings.bgValue.first().timestamp
-            )
-            medtronicHistoryData.addNewHistory(historyResult)
-            if (medLinkPumpStatus.needToGetBGHistory() && isInitialized()) {
-                missedBGs++
-                if (firstMissedBGTimestamp == 0L) {
-                    firstMissedBGTimestamp = lastBGHistoryRead
-                }
-            }
-        } else if (sensorDataReadings.bgValue.size > 1) {
-            if (sensorDataReadings.bgValue.first().timestamp > firstMissedBGTimestamp && System.currentTimeMillis() - lastPreviousHistory > 500000) {
-                previousBGHistory()
-                lastPreviousHistory = System.currentTimeMillis()
-            }
-            missedBGs = 0
-            firstMissedBGTimestamp = 0L
-        }
-        // val intent = buildIntentSensValues(*sensorDataReadings)
-        handleNewSensorData(sensorDataReadings)
-        // sensorDataReadings.bgValue.forEach { f ->
-        //
-        // }
-
-        handleDailyDoseUpdate()
-        //        medtronicHistoryData.addNewHistory();
-//        long latestbg = Arrays.stream(bgs).mapToLong(f -> f.date).max().orElse(0l);
-//        if (bgFailedToRead > 6) {
-//            ToastUtils.showToastInUiThread(context, R.string.pump_status_pump_unreachable);
-//        } else if (System.currentTimeMillis() - latestBGHistoryRead > 60000 * 5) { //TODO
-//            bgFailedToRead++;
-
-        //         if (sensorDataReadings.bgValue.isNotEmpty() && sensorDataReadings.bgValue.first().value != 0.0) {
-//             aapsLogger.info(LTag.PUMPBTCOMM, "pump bg history")
-//             readPumpBGHistory(false)
-//         }
-//
-
-        //        } else {
-//            bgFailedToRead = 0;
-//        }
     }
 
     fun calibrate(calibrationInfo: Double) {
@@ -3462,15 +3397,15 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
             medLinkCalibrationCallback,
             btSleepTime = 30000,
             bleCommand,
-            currentPumpStatus === PumpStatusType.Suspended
+            currentPumpStatus === PumpRunningState.Suspended
         )
 
         aapsLogger.info(LTag.DATABASE, msg.toString())
-        val msgs = MedLinkPumpMessage<PumpDriverState, Any>(buildStartStopCommands(), btSleepTime)
-        if (msgs.commands.isEmpty()) {
-            medLinkService!!.medtronicUIComm?.executeCommandCP(msg)
+        val startStopMsg = buildStartStopCommands()
+        if (startStopMsg.isNotEmpty()) {
+            medLinkService!!.medtronicUIComm?.executeCommandCP(MedLinkPumpMessage<PumpDriverState, Any>(startStopMsg, btSleepTime), msg)
         } else {
-            medLinkService!!.medtronicUIComm?.executeCommandCP(msgs, msg)
+            medLinkService!!.medtronicUIComm?.executeCommandCP(msg)
         }
     }
 
@@ -3500,6 +3435,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                 lastCalibration?.isBefore(pumpStatusData.nextCalibration) == true                                                             -> {
                     medtronicUtil.dismissNotification(MedtronicNotificationType.SecondCalibrationAlarm, rxBus)
                     medtronicUtil.dismissNotification(MedtronicNotificationType.FirstCalibrationAlarm, rxBus)
+                    medtronicUtil.dismissNotification(MedtronicNotificationType.CalibrationSuccess, rxBus)
                     hasFirstAlert = false
                     hasSecondAlert = false
                 }
@@ -3509,26 +3445,27 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
 
     var lastReservoirLevel = -1.0
     private fun handleDailyDoseUpdate() {
-        if (lastReservoirLevel >= 0.0 && pumpStatusData.reservoirLevel + 0.3 > lastReservoirLevel) {
+        if (lastReservoirLevel >= 0.0 && lastReservoirLevel - pumpStatusData.reservoirRemainingUnits > 0.3) {
             readBolusHistory()
-            lastReservoirLevel = pumpStatusData.reservoirLevel
         }
-//        pumpSync.
-//        pumpSync.createOrUpdateTotalDailyDose()
+        lastReservoirLevel = pumpStatusData.reservoirRemainingUnits
+
+        //        pumpSync.
+        //        pumpSync.createOrUpdateTotalDailyDose()
     }
 
     var previousSensorUpTime: Int = -1
 
     fun sensorReInit() {
-        if(sp.getBoolean(R.bool.key_medlink_handle_sensor_change_event, false)) {
-        EnliteInterval.clear()
-        pumpSync.insertTherapyEventIfNewWithTimestamp(
-            pumpStatusData.lastBGTimestamp,
-            DetailedBolusInfo.EventType.SENSOR_CHANGE,
-            pumpSerial = medLinkServiceData.pumpID,
-            pumpType = pumpType
-        )
-    }
+        if (sp.getBoolean(R.bool.key_medlink_handle_sensor_change_event, false)) {
+            EnliteInterval.clear()
+            pumpSync.insertTherapyEventIfNewWithTimestamp(
+                pumpStatusData.lastBGTimestamp,
+                DetailedBolusInfo.EventType.SENSOR_CHANGE,
+                pumpSerial = medLinkServiceData.pumpID,
+                pumpType = pumpType
+            )
+        }
     }
 
     fun handleNewSensorData(sens: BgSync.BgHistory) {
@@ -3540,10 +3477,6 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                 }
                 previousSensorUpTime = sens.bgValue.first().sensorUptime!!
             }
-
-            if (lastBolusTime == 0L) {
-                lastBolusTime = pumpStatusData.lastBolusTime?.time ?: 0L
-            }
         }
         handleNewPumpData()
         if (sens.bgValue.size == 1 &&
@@ -3553,16 +3486,17 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
             if (firstMissedBGTimestamp == 0L && isInitialized()) {
                 firstMissedBGTimestamp = lastBGHistoryRead
             }
-        } else if (sens.bgValue.size > 1) {
+        } else {
             aapsLogger.info(LTag.PUMPBTCOMM, "" + isInitialized)
             aapsLogger.info(LTag.PUMPBTCOMM, "" + isInitialized())
-            if (isInitialized() &&
-                sens.bgValue.first().timestamp != pumpStatusData.getLastBGTimestamp() &&
-                sens.bgValue.last().timestamp > firstMissedBGTimestamp &&
-                System.currentTimeMillis() - lastPreviousHistory > 500000
+            // medLinkServiceData.
+            pumpSync.expectedPumpState()
+            if (isInitialized() && sens.bgValue.size > 1 &&
+                sens.bgValue.map { it.timestamp }.min() > firstMissedBGTimestamp &&
+                System.currentTimeMillis() - lastPreviousHistory > 1800000 ||
+                System.currentTimeMillis() - lastPreviousHistory > 6000000
             ) {
                 previousBGHistory()
-                lastPreviousHistory = System.currentTimeMillis()
             }
             missedBGs = 0
             firstMissedBGTimestamp = 0L
@@ -3582,12 +3516,15 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         medtronicUtil.dismissNotification(MedtronicNotificationType.PumpUnreachable, rxBus)
         handleBatteryData()
         //        if(sens.length>0) {
-        handleBolusDelivered(lastDetailedBolusInfo)
-        //        }
+        if (lastDetailedBolusInfo != null) {
+            handleBolusDelivered(lastDetailedBolusInfo)
+        }
+
+        handleDailyDoseUpdate()
         handleProfile()
         handleBolusAlarm()
         handleCalibrationData()
-        if (temporaryBasal?.rate == 0.0 && temporaryBasal?.duration!! > 0 && pumpStatusData.pumpStatusType == PumpStatusType.Running) {
+        if (temporaryBasal?.rate == 0.0 && temporaryBasal?.duration!! > 0 && pumpStatusData.pumpRunningState == PumpRunningState.Running) {
             stopPump(object : Callback() {
                 override fun run() {
                     aapsLogger.info(LTag.PUMP, "Stopping unstopped pump")
@@ -3605,8 +3542,15 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                 )?.rate ?: 0.0
             ).replace(",", ".").toDouble()
             if (lastProfileRead > 0 && System.currentTimeMillis() - lastProfileRead > 600000 && basalProfile != null && rate != medLinkPumpStatus
-                    .currentBasal
+                    .currentBasal && medLinkPumpStatus.pumpRunningState == PumpRunningState.Running
             ) {
+                aapsLogger.info(LTag.PUMPBTCOMM, "reading profile")
+                aapsLogger.info(LTag.PUMPBTCOMM, "" + lastProfileRead)
+                aapsLogger.info(LTag.PUMPBTCOMM, "" + rate)
+                aapsLogger.info(LTag.PUMPBTCOMM, "" + medLinkPumpStatus
+                    .currentBasal)
+                basalProfile?.toString()?.let { aapsLogger.info(LTag.PUMPBTCOMM, it) }
+
                 readPumpProfile()
             }
         }
@@ -3616,22 +3560,31 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         if (!medLinkPumpStatus.bgAlarmOn) {
             isClosedLoopAllowed(Constraint(false))
         } else {
-            isClosedLoopAllowed(Constraint(false))
+            isClosedLoopAllowed(Constraint(true))
         }
     }
 
     override fun handleBolusDelivered(lastBolusInfo: DetailedBolusInfo?) {
-        if (checkBolusAtNextStatus) {
-            if (lastBolusInfo != null && lastBolusInfo.insulin == medLinkPumpStatus.lastBolusAmount && medLinkPumpStatus.lastBolusTime!!.time > lastBolusTime) {
-                lastBolusTime = medLinkPumpStatus.lastBolusTime!!.time
-                lastBolusInfo.bolusTimestamp = lastBolusTime
-                lastDeliveredBolus = lastBolusInfo.insulin
-                checkBolusAtNextStatus = false
+        if (bolusHistoryCheck) {
+            val state = pumpSync.expectedPumpState()
+            if (lastBolusInfo != null &&
+                lastBolusInfo.insulin == medLinkPumpStatus.lastBolusAmount &&
+                medLinkPumpStatus.lastBolusTime != null &&
+                state.bolus != null &&
+                medLinkPumpStatus.lastBolusTime!!.time > state.bolus?.timestamp!!
+            ) {
+                lastBolusInfo.bolusTimestamp = medLinkPumpStatus.lastBolusTime!!.time
                 handleNewTreatmentData(of(JSONObject(lastBolusInfo.toJsonString())))
+                bolusHistoryCheck = false
             } else {
+                aapsLogger.info(LTag.PUMPBTCOMM, "bolus not delivered")
+                aapsLogger.info(LTag.PUMPBTCOMM, lastBolusInfo.toString())
+                aapsLogger.info(LTag.PUMPBTCOMM, "" + medLinkPumpStatus.lastBolusAmount)
                 val i = Intent(context, ErrorHelperActivity::class.java)
                 i.putExtra("soundid", R.raw.boluserror)
-                i.putExtra("status", result!!.comment)
+                if (result != null) {
+                    i.putExtra("status", result!!.comment)
+                }
                 i.putExtra("title", rh.gs(string.medtronic_cmd_bolus_could_not_be_delivered))
                 i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 context.startActivity(i)
@@ -3646,14 +3599,16 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
             lastBatteryLevel = currentLevel
         }
         if ((currentLevel - batteryDelta * 5 <= minimumBatteryLevel ||
-                medLinkServiceData.batteryLevel <= minimumBatteryLevel) &&
-            medLinkPumpStatus.pumpStatusType === PumpStatusType.Suspended
+                pumpStatusData.batteryRemaining <= minimumBatteryLevel) &&
+            medLinkPumpStatus.pumpRunningState === PumpRunningState.Suspended
         ) {
             clearTempBasal()
+
         }
         if (batteryLastRead == 0L) {
             batteryLastRead = currentBatRead
         } else {
+
             val batDelta = (currentBatRead - batteryLastRead) / 60000
             var delta = 0.0
             if (batDelta > 0L) {
@@ -3663,29 +3618,32 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                 batteryDelta = delta
             }
         }
+        if (pumpStatusData.isBatteryChanged) {
+            readBolusHistory()
+        }
     }
 
     override val temporaryBasal: PumpSync.PumpState.TemporaryBasal?
         get() {
-            if (!tempBasalMicrobolusOperations!!.operations.isEmpty()) {
+            if (!tempBasalMicrobolusOperations.operations.isEmpty()) {
 
-                // tempBasal.date(tempBasalMicrobolusOperations!!.operations.first.releaseTime.toDate().time)
+                // tempBasal.date(tempBasalMicrobolusOperations.operations.first.releaseTime.toDate().time)
                 // tempBasal.duration(
-                //     tempBasalMicrobolusOperations!!.durationInMinutes
+                //     tempBasalMicrobolusOperations.durationInMinutes
                 // )
-                // tempBasal.desiredRate = tempBasalMicrobolusOperations!!.absoluteRate
-                // if (tempBasalMicrobolusOperations!!.absoluteRate == 0.0) {
+                // tempBasal.desiredRate = tempBasalMicrobolusOperations.absoluteRate
+                // if (tempBasalMicrobolusOperations.absoluteRate == 0.0) {
                 //     tempBasal.absolute(0.0)
                 // } else {
                 //     tempBasal.absolute(baseBasalRate)
                 // }
                 return PumpSync.PumpState.TemporaryBasal(
-                    timestamp = tempBasalMicrobolusOperations!!.operations.first.releaseTime.toDate().time,
-                    duration = tempBasalMicrobolusOperations!!.durationInMinutes * 60 * 1000L,
+                    timestamp = tempBasalMicrobolusOperations.operations.first.releaseTime.toDate().time,
+                    duration = tempBasalMicrobolusOperations.durationInMinutes * 60 * 1000L,
                     isAbsolute = false,
                     rate = baseBasalRate,
                     type = TemporaryBasalType.NORMAL,
-                    desiredRate = tempBasalMicrobolusOperations?.absoluteRate!!,
+                    desiredRate = tempBasalMicrobolusOperations.absoluteRate,
                     id = 0L,
                     pumpId = 0L
                 )
@@ -3726,13 +3684,15 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         try {
             if (sp.getString(string.key_medlink_battery_info, "Age") !== "Age") {
                 battery.put("voltage", pumpStatusData.batteryVoltage)
+                battery.put("percent", batteryLevel)
+
             } else {
                 val dto = BatteryStatusDTO()
                 dto.voltage = pumpStatusData.batteryVoltage
                 dto.batteryStatusType = BatteryStatusDTO.BatteryStatusType.Unknown
                 val type = BatteryType.valueOf(sp.getString(string.key_medtronic_battery_type, BatteryType.None.name))
                 pumpStatusData.deviceBatteryRemaining = dto.getCalculatedPercent(type)
-                battery.put("percent", pumpStatusData.deviceBatteryRemaining)
+                battery.put("percent", pumpStatusData.batteryRemaining)
             }
             result.put("battery", battery)
             result.put("clock", dateUtil.toISOString(pumpStatusData.lastDataTime))
@@ -3747,15 +3707,12 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
         else BgSync.GlucoseUnit.MMOL
     }
 
-
-
     companion object {
 
         var isBusy = false
     }
 
-    init {
-        tempBasalMicrobolusOperations = TempBasalMicrobolusOperations()
+    override fun onStart() {
         displayConnectionMessages = false
         injector?.let { MedLinkStatusParser.parseStatus(emptyArray<String>(), medLinkPumpStatus, it) }
         serviceConnection = object : ServiceConnection {
@@ -3781,6 +3738,7 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
                 }.start()
             }
         }
+        super.onStart()
     }
 
     override fun setPumpDeviceState(state: PumpDeviceState) {
@@ -3789,5 +3747,9 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
 
     override fun setMedtronicPumpModel(model: String) {
         medtronicUtil.medtronicPumpModel = MedLinkMedtronicDeviceType.getByDescription(model)
+    }
+
+    override fun setBatteryLevel(batteryLevel: Int) {
+        pumpStatusData.batteryRemaining = batteryLevel
     }
 }

@@ -4,7 +4,6 @@ import info.nightscout.androidaps.plugins.pump.common.hw.medlink.activities.MedL
 import info.nightscout.androidaps.plugins.pump.common.hw.medlink.ble.command.BleCommand
 import info.nightscout.androidaps.plugins.pump.common.hw.medlink.ble.data.CommandStructure
 import info.nightscout.androidaps.plugins.pump.common.hw.medlink.defs.MedLinkCommandType
-import info.nightscout.androidaps.queue.commands.Command
 import info.nightscout.shared.logging.AAPSLogger
 import info.nightscout.shared.logging.LTag
 import java.util.*
@@ -16,26 +15,27 @@ import java.util.stream.Stream
  * Created by Dirceu on 01/04/21.
  */
 abstract class CommandExecutor<B> protected constructor(
-    val commandList: MutableList<CommandStructure<B,BleCommand>>,
-val aapsLogger: AAPSLogger
+    val commandList: MutableList<CommandStructure<B, BleCommand>>,
+    val aapsLogger: AAPSLogger,
 ) : Runnable {
 
     var isConfirmed: Boolean = false
-    private var commandPosition = 0
+    private var commandPosition = Integer(0)
     private var functionPosition = 0
     private var currentCommand: MedLinkCommandType? = null
     var nrRetries = 0
-    protected set
+        protected set
 
-        protected constructor (commandType: MedLinkCommandType, aapsLogger: AAPSLogger) :
-    this(
-        mutableListOf(
-            CommandStructure(
-                commandType, Optional.empty(),
-                Optional.empty()
-            )
-        ), aapsLogger
-    )
+    protected constructor (commandType: MedLinkCommandType, aapsLogger: AAPSLogger) :
+        this(
+            mutableListOf(
+                CommandStructure(
+                    commandType, Optional.empty(),
+                    Optional.empty(),
+                    CommandPriority.HIGH
+                )
+            ), aapsLogger
+        )
 
     //
     //    protected CommandExecutor(RemainingBleCommand remainingBleCommand) {
@@ -49,15 +49,29 @@ val aapsLogger: AAPSLogger
         return if (commandPosition >= commandList.size) {
             MedLinkCommandType.NoCommand
         } else {
-            commandList[commandPosition].command
+            commandList[commandPosition.toInt()].command
         }
     }
 
     fun nextRaw(): ByteArray {
-        return if (commandPosition >= commandList.size) {
-            MedLinkCommandType.NoCommand.getRaw()
-        } else {
-            commandList[commandPosition].commandArgument
+        synchronized(commandPosition) {
+            return try {
+                if (commandPosition.toInt() >= commandList.size) {
+                    MedLinkCommandType.NoCommand.getRaw()
+                } else {
+                    commandList[commandPosition.toInt()].commandArgument
+                }
+            } catch (e: ArrayIndexOutOfBoundsException) {
+                aapsLogger.info(LTag.PUMPBTCOMM, "exception at getting next raw $commandPosition")
+                val it = commandList.iterator()
+                val buf = StringBuffer()
+                while (it.hasNext()) {
+                    buf.append(it.next().toString())
+                    buf.append("\n")
+                }
+                aapsLogger.info(LTag.PUMPBTCOMM, commandList.joinToString { buf.toString() })
+                return MedLinkCommandType.NoCommand.getRaw()
+            }
         }
     }
 
@@ -66,7 +80,7 @@ val aapsLogger: AAPSLogger
             currentCommand = commandList[functionPosition].command
             commandList[functionPosition].parseFunction.get().compose {
                 aapsLogger.info(
-                    LTag.APS, "applied"
+                    LTag.APS, "applied $functionPosition"
                 )
                 functionPosition += 1
                 it
@@ -88,7 +102,7 @@ val aapsLogger: AAPSLogger
 
     fun getCurrentCommand(): MedLinkCommandType {
         return if (commandPosition < commandList.size)
-            commandList[commandPosition].command
+            commandList[commandPosition.toInt()].command
         else MedLinkCommandType.NoCommand
     }
 
@@ -100,16 +114,17 @@ val aapsLogger: AAPSLogger
     }
 
     fun commandExecuted() {
-        if (commandPosition == 0) {
+        if (commandPosition.toInt() == 0) {
             nrRetries++
-        } else if (commandList[commandPosition].command != MedLinkCommandType.NoCommand) {
+        } else if (commandPosition < commandList.size && commandList[commandPosition.toInt()].command != MedLinkCommandType.NoCommand) {
             nrRetries++
         }
-        commandPosition += 1
+        commandPosition = Integer(commandPosition.toInt() + 1)
+
     }
 
     open fun clearExecutedCommand() {
-        commandPosition = 0
+        commandPosition = Integer(0)
         functionPosition = 0
         isConfirmed = false
     }
@@ -134,7 +149,7 @@ val aapsLogger: AAPSLogger
                     MedLinkStandardReturn<*>
                     >?
                     >>
-            >
+            >,
     ): Boolean {
         return (commandList == this.commandList)
     }
@@ -152,7 +167,7 @@ val aapsLogger: AAPSLogger
 
     protected fun nextCommandData(): ByteArray {
         return if (commandPosition < commandList.size) {
-            commandList[commandPosition].commandArgument
+            commandList[commandPosition.toInt()].commandArgument
         } else {
             MedLinkCommandType.NoCommand.getRaw()
         }
@@ -173,9 +188,13 @@ val aapsLogger: AAPSLogger
     }
 
     val isInitialized: Boolean
-    get() = commandPosition > 0 || functionPosition > 0
+        get() = commandPosition > 0 || functionPosition > 0
 
     override fun run() {
         isConfirmed = false
+    }
+
+    fun commandFailed() {
+
     }
 }

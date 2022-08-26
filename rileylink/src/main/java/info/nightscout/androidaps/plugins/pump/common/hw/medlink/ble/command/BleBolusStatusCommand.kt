@@ -5,6 +5,7 @@ import info.nightscout.androidaps.plugins.pump.common.data.MedLinkPartialBolus
 import info.nightscout.androidaps.plugins.pump.common.defs.PumpType
 import info.nightscout.androidaps.plugins.pump.common.hw.medlink.activities.BolusProgressCallback
 import info.nightscout.androidaps.plugins.pump.common.hw.medlink.ble.MedLinkBLE
+import info.nightscout.androidaps.plugins.pump.common.hw.medlink.defs.MedLinkCommandType
 import info.nightscout.androidaps.plugins.pump.common.hw.medlink.service.MedLinkServiceData
 import info.nightscout.androidaps.plugins.pump.common.hw.medlink.service.MedLinkStatusParser
 import info.nightscout.shared.logging.AAPSLogger
@@ -34,7 +35,8 @@ class BleBolusStatusCommand(
                 val onHoldCommand = bleComm.onHoldCommandQueue.first
                 val firstCommand = onHoldCommand.commandList.first()
                 aapsLogger.info(LTag.PUMPBTCOMM,"onholdcheck")
-                if(bleComm.isBolus(firstCommand.command) && firstCommand.parseFunction.isPresent &&
+                aapsLogger.info(LTag.PUMPBTCOMM,firstCommand.toString())
+                if(firstCommand.command.isSameCommand(MedLinkCommandType.BolusStatus) && firstCommand.parseFunction.isPresent &&
                     firstCommand.parseFunction.get() is BolusProgressCallback){
                     aapsLogger.info(LTag.PUMPBTCOMM,"bolusOnHold")
                     val callback: BolusProgressCallback= firstCommand.parseFunction.get() as BolusProgressCallback
@@ -42,6 +44,9 @@ class BleBolusStatusCommand(
                         aapsLogger.info(LTag.PUMPBTCOMM,"remove old bolus")
                         bleComm.onHoldCommandQueue.removeFirst()
                         bleComm.needToCheckOnHold = bleComm.onHoldCommandQueue.isNotEmpty()
+                    } else {
+                        aapsLogger.info(LTag.PUMPBTCOMM,"reprocess command")
+                        bleComm.reprocessOnHold()
                     }
                 }
             }
@@ -51,6 +56,7 @@ class BleBolusStatusCommand(
                 status.bolusDeliveredAmount < status.lastBolusAmount!!
             ) {
                 bleComm.clearExecutedCommand()
+                bleComm.postponeCurrentCommand()
             } else {
                 applyResponse(pumpResponse.toString(), bleComm.currentCommand, bleComm)
                 bleComm.completedCommand()

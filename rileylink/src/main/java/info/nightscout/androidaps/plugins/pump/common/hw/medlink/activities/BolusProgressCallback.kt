@@ -16,7 +16,7 @@ import info.nightscout.androidaps.plugins.pump.common.hw.medlink.ble.CommandExec
 import info.nightscout.androidaps.plugins.pump.common.hw.medlink.defs.MedLinkPumpDevice
 import info.nightscout.androidaps.plugins.pump.common.hw.medlink.service.MedLinkStatusParser
 
-import info.nightscout.androidaps.utils.resources.ResourceHelper
+import info.nightscout.androidaps.interfaces.ResourceHelper
 import org.json.JSONObject
 import java.util.function.Supplier
 import java.util.stream.Stream
@@ -51,6 +51,7 @@ data class BolusProgressCallback(
         aapsLogger.info(LTag.PUMPBTCOMM, "" + pumpStatus.lastBolusInfo)
         aapsLogger.info(LTag.PUMPBTCOMM, detailedBolusInfo.toJsonString())
         if (pumpStatus.lastBolusAmount != null) {
+            aapsLogger.info(LTag.PUMPBTCOMM,"lastbolusAmount")
             val bolusEvent = EventOverviewBolusProgress
             bolusEvent.t = t
             bolusEvent.status = resourceHelper.gs(R.string.bolusdelivering, pumpStatus.bolusDeliveredAmount, pumpStatus.lastBolusAmount)
@@ -58,6 +59,8 @@ data class BolusProgressCallback(
 
             rxBus.send(bolusEvent)
             if (bolusEvent.percent == 100 || pumpStatus.bolusDeliveredAmount == 0.0) {
+                aapsLogger.info(LTag.PUMPBTCOMM,"boluscompleted")
+
                 pumpStatus.lastBolusInfo.let {
                     it.timestamp = pumpStatus.lastBolusTime?.time ?: it.timestamp
 
