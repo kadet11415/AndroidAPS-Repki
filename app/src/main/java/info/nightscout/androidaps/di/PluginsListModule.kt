@@ -7,7 +7,6 @@ import dagger.multibindings.IntoMap
 import info.nightscout.androidaps.danaRKorean.DanaRKoreanPlugin
 import info.nightscout.androidaps.danaRv2.DanaRv2Plugin
 import info.nightscout.androidaps.danar.DanaRPlugin
-import info.nightscout.androidaps.plugin.general.openhumans.OpenHumansUploaderPlugin
 import info.nightscout.androidaps.plugins.aps.loop.LoopPlugin
 import info.nightscout.androidaps.plugins.pump.eopatch.EopatchPumpPlugin
 import info.nightscout.androidaps.plugins.pump.insight.LocalInsightPlugin
@@ -236,7 +235,6 @@ abstract class PluginsListModule {
     @IntKey(222)
     abstract fun bindOpenAPSSMBAutoISFPlugin(plugin: OpenAPSSMBDynamicISFPlugin): PluginBase
 
-
     @Binds
     @AllConfigs
     @IntoMap
@@ -317,7 +315,7 @@ abstract class PluginsListModule {
     abstract fun bindNSClientV3Plugin(plugin: NSClientV3Plugin): PluginBase
 
     @Binds
-    @Unfinished
+    @NotNSClient
     @IntoMap
     @IntKey(360)
     abstract fun bindTidepoolPlugin(plugin: TidepoolPlugin): PluginBase
@@ -333,12 +331,6 @@ abstract class PluginsListModule {
     @IntoMap
     @IntKey(366)
     abstract fun bindDataBroadcastPlugin(plugin: DataBroadcastPlugin): PluginBase
-
-    @Binds
-    @NotNSClient
-    @IntoMap
-    @IntKey(368)
-    abstract fun bindsOpenHumansPlugin(plugin: OpenHumansUploaderPlugin): PluginBase
 
     @Binds
     @AllConfigs
