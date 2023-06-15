@@ -65,9 +65,9 @@ class VersionCheckerPlugin @Inject constructor(
         versionCheckerUtils.triggerCheckVersion()
         if (isOldVersion(gracePeriod.veryOld.daysToMillis()))
             value.set(aapsLogger, false, rh.gs(R.string.very_old_version), this)
-        val endDate = sp.getLong(rh.gs(info.nightscout.core.utils.R.string.key_app_expiration) + "_" + config.VERSION_NAME, 0)
-        if (endDate != 0L && dateUtil.now() > endDate)
-            value.set(aapsLogger, false, rh.gs(R.string.application_expired), this)
+        // val endDate = sp.getLong(rh.gs(info.nightscout.core.utils.R.string.key_app_expiration) + "_" + config.VERSION_NAME, 0)
+        // if (endDate != 0L && dateUtil.now() > endDate)
+        //     value.set(aapsLogger, false, rh.gs(R.string.application_expired), this)
         return value
     }
 
