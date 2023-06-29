@@ -199,7 +199,8 @@ open class MedLinkMedtronicPumpPlugin @Inject constructor(
     private var customActions: List<CustomAction>? = null
     private var lastStatus = PumpRunningState.Running.status
     protected var lastBGHistoryRead = 0L
-    var basalProfile: BasalProfile? = null
+    var
+        basalProfile: BasalProfile? = null
     private var lastPreviousHistory = 0L
     private var lastTryToConnect = 0L
     private var lastBgs: Array<Int?>? = null
