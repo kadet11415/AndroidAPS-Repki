@@ -1,4 +1,4 @@
-package info.nightscout.androidaps.database.daos
+package info.nightscout.database.impl.daos
 
 import androidx.room.Dao
 import androidx.room.Query

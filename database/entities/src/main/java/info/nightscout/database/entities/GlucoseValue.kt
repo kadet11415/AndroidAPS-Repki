@@ -116,7 +116,6 @@ data class GlucoseValue(
         LIBRE_1_TOMATO("Tomato"),
         LIBRE_1_RF("Rfduino"),
         LIBRE_1_LIMITTER("LimiTTer"),
-        GLIMP("Glimp"),
         LIBRE_1_BUBBLE("Bubble"),
         LIBRE_1_ATOM("Bubble"),
         LIBRE_1_GLIMP("Glimp"),
@@ -153,6 +152,7 @@ data class GlucoseValue(
             LIBRE_2_NATIVE,
             UNKNOWN // Better check for FLAT on unknown sources too
         ).any { it.text == text }
+
 
         companion object {
 

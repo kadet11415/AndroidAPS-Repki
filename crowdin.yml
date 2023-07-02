@@ -17,8 +17,6 @@ files:
     translation: /plugins/constraints/src/main/res/values-%android_code%/%original_file_name%
   - source: /plugins/automation/src/main/res/values/strings.xml
     translation: /plugins/automation/src/main/res/values-%android_code%/strings.xml
-  - source: /plugins/openhumans/src/main/res/values/strings.xml
-    translation: /plugins/openhumans/src/main/res/values-%android_code%/strings.xml
   - source: /plugins/sensitivity/src/main/res/values/strings.xml
     translation: /plugins/sensitivity/src/main/res/values-%android_code%/strings.xml
   - source: /plugins/source/src/main/res/values/strings.xml
@@ -35,6 +33,8 @@ files:
     translation: /plugins/sync/src/main/res/values-%android_code%/strings.xml
     translate_attributes: 0
     content_segmentation: 0
+  - source: /plugins/sync/src/main/res/values/oh_strings.xml
+    translation: /plugins/sync/src/main/res/values-%android_code%/oh_strings.xml
   - source: /plugins/constraints/src/main/res/values/strings.xml
     translation: /plugins/constraints/src/main/res/values-%android_code%/strings.xml
   - source: /core/graph/src/main/res/values/strings.xml
@@ -53,6 +53,8 @@ files:
     translation: /pump/pump-core/src/main/res/values-%android_code%/strings.xml
   - source: /pump/eopatch/src/main/res/values/strings.xml
     translation: /pump/eopatch/src/main/res/values-%android_code%/strings.xml
+  - source: /pump/eopatch/src/main/res/values/strings_alarm.xml
+    translation: /pump/eopatch/src/main/res/values-%android_code%/strings_alarm.xml
   - source: /pump/diaconn/src/main/res/values/strings.xml
     translation: /pump/diaconn/src/main/res/values-%android_code%/strings.xml
   - source: /pump/pump-common/src/main/res/values/strings.xml

@@ -1,6 +1,6 @@
 package info.nightscout.database.impl
 
-import info.nightscout.androidaps.database.daos.MedLinkDao
+import info.nightscout.database.impl.daos.MedLinkDao
 import info.nightscout.androidaps.database.daos.delegated.DelegatedMedLinkDao
 import info.nightscout.database.entities.interfaces.DBEntry
 import info.nightscout.database.impl.daos.*
@@ -28,6 +28,7 @@ internal class DelegatedAppDatabase(val changes: MutableList<DBEntry>, val datab
     val foodDao: FoodDao = DelegatedFoodDao(changes, database.foodDao)
     val deviceStatusDao: DeviceStatusDao = DelegatedDeviceStatusDao(changes, database.deviceStatusDao)
     val offlineEventDao: OfflineEventDao = DelegatedOfflineEventDao(changes, database.offlineEventDao)
+    val heartRateDao: HeartRateDao = DelegatedHeartRateDao(changes, database.heartRateDao)
     val medLinkConfigDao: MedLinkDao = DelegatedMedLinkDao(changes, database.medLinkDao)
     fun clearAllTables() = database.clearAllTables()
 }
