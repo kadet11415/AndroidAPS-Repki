@@ -20,7 +20,7 @@ import info.nightscout.androidaps.R
 import info.nightscout.androidaps.danaRKorean.DanaRKoreanPlugin
 import info.nightscout.androidaps.danaRv2.DanaRv2Plugin
 import info.nightscout.androidaps.danar.DanaRPlugin
-import info.nightscout.androidaps.plugins.aps.loop.LoopPlugin
+import info.nightscout.plugins.sync.openhumans.OpenHumansUploaderPlugin
 import info.nightscout.androidaps.plugins.pump.eopatch.EopatchPumpPlugin
 import info.nightscout.androidaps.plugins.pump.insight.LocalInsightPlugin
 import info.nightscout.androidaps.plugins.pump.medtronic.MedLinkMedtronicPumpPlugin
@@ -41,6 +41,7 @@ import info.nightscout.interfaces.protection.ProtectionCheck.ProtectionType.BIOM
 import info.nightscout.interfaces.protection.ProtectionCheck.ProtectionType.CUSTOM_PASSWORD
 import info.nightscout.interfaces.protection.ProtectionCheck.ProtectionType.CUSTOM_PIN
 import info.nightscout.interfaces.protection.ProtectionCheck.ProtectionType.NONE
+import info.nightscout.plugins.aps.loop.LoopPlugin
 
 import info.nightscout.plugins.aps.openAPSAMA.OpenAPSAMAPlugin
 import info.nightscout.plugins.aps.openAPSSMB.OpenAPSSMBPlugin

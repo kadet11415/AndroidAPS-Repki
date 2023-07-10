@@ -1,6 +1,6 @@
 package info.nightscout.androidaps.database.daos.delegated
 
-import info.nightscout.androidaps.database.daos.MedLinkDao
+import info.nightscout.database.impl.daos.MedLinkDao
 import info.nightscout.database.entities.MedLinkConfig
 import info.nightscout.database.entities.interfaces.DBEntry
 import info.nightscout.database.impl.daos.delegated.DelegatedDao
